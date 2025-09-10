@@ -1,0 +1,13 @@
+name = Physics Combination Mod
+author = Combined Mod Integration
+description = A comprehensive physics enhancement mod that combines Progressive Destruction, Impact Based Structural Integrity (IBSIT), and Mass Based Collateral System (MBCS) into a unified, configurable physics simulation. Features dual options menus accessible from both mod manager and pause menu.
+
+Features:
+- Progressive Destruction: Advanced debris management, wind/force systems, crumbling mechanics, explosions
+- IBSIT: Physics-based structural integrity, realistic building collapse, material-specific damage
+- MBCS: Mass-based collateral detection, proximity collapse triggering
+- Dual Options System: Configure all systems from mod manager or in-game pause menu
+- Performance Optimization: Intelligent FPS management and debris cleanup
+- Modular Design: Enable/disable individual systems independently
+
+tags = physics, destruction, structural, building, simulation

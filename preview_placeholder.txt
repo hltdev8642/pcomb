@@ -1,0 +1,15 @@
+# Preview Image Placeholder
+
+This file would contain a preview.jpg image for the mod manager.
+
+To create the actual preview image:
+1. Take a screenshot showing the combined physics effects in action
+2. Include multiple destruction types (crumbling, particles, collapse)
+3. Save as preview.jpg (512x512 recommended)
+4. Replace this file with the actual image
+
+Suggested preview content:
+- Split-screen showing before/after destruction
+- Multiple physics systems active simultaneously
+- High-quality visual effects demonstration
+- Clear branding "Physics Combination Mod"
