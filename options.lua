@@ -16,6 +16,12 @@ function init()
     if not HasKey("savegame.mod.pcomb.global.performance_scale") then
         SetFloat("savegame.mod.pcomb.global.performance_scale", 1.0)
     end
+    if not HasKey("savegame.mod.pcomb.current_tab") then
+        SetInt("savegame.mod.pcomb.current_tab", 1)
+    end
+    if not HasKey("savegame.mod.pcomb.tab_scroll") then
+        SetInt("savegame.mod.pcomb.tab_scroll", 0)
+    end
 
     -- PRGD defaults
     if not HasKey("savegame.mod.pcomb.prgd.enabled") then
@@ -88,18 +94,37 @@ function draw()
     UiFont("bold.ttf", 24)
     UiText("Physics Combination Mod Settings")
     UiTranslate(0, 40)
-
-    -- Tab system
+    -- Tab system with scrolling
     UiAlign("left middle")
     UiTranslate(50, 0)
     UiFont("regular.ttf", 16)
 
-    local tabs = {"Global", "PRGD Core", "PRGD Advanced", "IBSIT Core", "IBSIT Advanced", "MBCS", "Performance"}
+    local tabs = {"Global", "PRGD Core", "PRGD Advanced", "IBSIT Core", "IBSIT Advanced", "MBCS", "Performance", "Materials"}
     local currentTab = GetInt("savegame.mod.pcomb.current_tab") or 1
+    local tabScroll = GetInt("savegame.mod.pcomb.tab_scroll") or 0
+    local visibleTabs = 6 -- Show 6 tabs at a time
+    local tabWidth = 120
+    local tabSpacing = 10
+    local totalTabWidth = tabWidth + tabSpacing
 
-    -- Tab buttons (draw inside a push/pop so we don't disturb the layout origin)
+    -- Navigation arrows for scrolling
     UiPush()
-    for i, tabName in ipairs(tabs) do
+    UiColor(0.5, 0.5, 0.5)
+    if tabScroll > 0 then
+        if UiTextButton("<", 30, 30) then
+            tabScroll = tabScroll - 1
+            SetInt("savegame.mod.pcomb.tab_scroll", tabScroll)
+        end
+    else
+        UiText(" ") -- Placeholder to maintain spacing
+    end
+    UiTranslate(40, 0)
+
+    -- Tab buttons (only show visible range)
+    local startTab = tabScroll + 1
+    local endTab = math.min(#tabs, tabScroll + visibleTabs)
+    
+    for i = startTab, endTab do
         UiPush()
         if currentTab == i then
             UiColor(0.3, 0.6, 1.0)
@@ -107,18 +132,33 @@ function draw()
             UiColor(0.4, 0.4, 0.4)
         end
 
-        if UiTextButton(tabName, 120, 30) then
+        if UiTextButton(tabs[i], tabWidth, 30) then
             SetInt("savegame.mod.pcomb.current_tab", i)
             currentTab = i
         end
         UiPop()
-        UiTranslate(130, 0)
+        UiTranslate(totalTabWidth, 0)
+    end
+
+    -- Right navigation arrow
+    if endTab < #tabs then
+        UiTranslate(10, 0)
+        if UiTextButton(">", 30, 30) then
+            tabScroll = tabScroll + 1
+            SetInt("savegame.mod.pcomb.tab_scroll", tabScroll)
+        end
     end
     UiPop()
 
+    -- Tab indicator showing current position
+    UiTranslate(0, 35)
+    UiFont("regular.ttf", 12)
+    UiColor(0.7, 0.7, 0.7)
+    UiText(string.format("Tab %d of %d (%s)", currentTab, #tabs, tabs[currentTab]))
+    UiTranslate(0, 15)
+
     -- Move down for content area but keep horizontal origin unchanged
     UiTranslate(0, 50)
-
     -- Render selected tab content
     if currentTab == 1 then
         drawGlobalTab()
@@ -134,6 +174,8 @@ function draw()
         drawMBCSTab()
     elseif currentTab == 7 then
         drawPerformanceTab()
+    elseif currentTab == 8 then
+        drawMaterialsTab()
     end
 end
 
@@ -556,6 +598,156 @@ function drawPerformanceTab()
     UiTranslate(0, 30)
 
     UiText("Current Performance Scale: " .. string.format("%.2f", performanceScale))
+end
+
+function drawMaterialsTab()
+    UiAlign("left top")
+    UiFont("regular.ttf", 18)
+
+    -- Material Properties Header
+    UiText("Material-Specific Physics Properties")
+    UiTranslate(0, 30)
+    UiFont("regular.ttf", 14)
+    UiText("Adjust how different materials behave in physics calculations")
+    UiTranslate(0, 40)
+
+    -- Glass Materials
+    UiFont("regular.ttf", 16)
+    UiColor(0.8, 0.9, 1.0)
+    UiText("Glass Materials")
+    UiTranslate(0, 25)
+    UiFont("regular.ttf", 14)
+    UiColor(1, 1, 1)
+    
+    UiText("Glass Density Multiplier")
+    UiTranslate(0, 25)
+    local glassDensity = GetFloat("savegame.mod.pcomb.materials.glass.density") or 2.5
+    local newGlassDensity = UiSliderWithValue("ui/common/dot.png", 360, 20, glassDensity, 1.0, 5.0, "%.2f")
+    if newGlassDensity ~= glassDensity then
+        SetFloat("savegame.mod.pcomb.materials.glass.density", newGlassDensity)
+    end
+    UiTranslate(0, 30)
+
+    UiText("Glass Collapse Resistance")
+    UiTranslate(0, 25)
+    local glassResistance = GetFloat("savegame.mod.pcomb.materials.glass.collapse_resistance") or 0.1
+    local newGlassResistance = UiSliderWithValue("ui/common/dot.png", 360, 20, glassResistance * 100, 1, 50, "%.1f") / 100
+    if newGlassResistance ~= glassResistance then
+        SetFloat("savegame.mod.pcomb.materials.glass.collapse_resistance", newGlassResistance)
+    end
+    UiTranslate(0, 40)
+
+    -- Wood Materials
+    UiFont("regular.ttf", 16)
+    UiColor(0.9, 0.8, 0.6)
+    UiText("Wood Materials")
+    UiTranslate(0, 25)
+    UiFont("regular.ttf", 14)
+    UiColor(1, 1, 1)
+    
+    UiText("Wood Density Multiplier")
+    UiTranslate(0, 25)
+    local woodDensity = GetFloat("savegame.mod.pcomb.materials.wood.density") or 0.6
+    local newWoodDensity = UiSliderWithValue("ui/common/dot.png", 360, 20, woodDensity, 0.3, 1.2, "%.2f")
+    if newWoodDensity ~= woodDensity then
+        SetFloat("savegame.mod.pcomb.materials.wood.density", newWoodDensity)
+    end
+    UiTranslate(0, 30)
+
+    UiText("Wood Collapse Resistance")
+    UiTranslate(0, 25)
+    local woodResistance = GetFloat("savegame.mod.pcomb.materials.wood.collapse_resistance") or 0.4
+    local newWoodResistance = UiSliderWithValue("ui/common/dot.png", 360, 20, woodResistance * 100, 20, 80, "%.1f") / 100
+    if newWoodResistance ~= woodResistance then
+        SetFloat("savegame.mod.pcomb.materials.wood.collapse_resistance", newWoodResistance)
+    end
+    UiTranslate(0, 40)
+
+    -- Stone/Concrete Materials
+    UiFont("regular.ttf", 16)
+    UiColor(0.7, 0.7, 0.7)
+    UiText("Stone & Concrete Materials")
+    UiTranslate(0, 25)
+    UiFont("regular.ttf", 14)
+    UiColor(1, 1, 1)
+    
+    UiText("Stone Density Multiplier")
+    UiTranslate(0, 25)
+    local stoneDensity = GetFloat("savegame.mod.pcomb.materials.stone.density") or 2.6
+    local newStoneDensity = UiSliderWithValue("ui/common/dot.png", 360, 20, stoneDensity, 1.5, 4.0, "%.2f")
+    if newStoneDensity ~= stoneDensity then
+        SetFloat("savegame.mod.pcomb.materials.stone.density", newStoneDensity)
+    end
+    UiTranslate(0, 30)
+
+    UiText("Stone Collapse Resistance")
+    UiTranslate(0, 25)
+    local stoneResistance = GetFloat("savegame.mod.pcomb.materials.stone.collapse_resistance") or 0.8
+    local newStoneResistance = UiSliderWithValue("ui/common/dot.png", 360, 20, stoneResistance * 100, 60, 95, "%.1f") / 100
+    if newStoneResistance ~= stoneResistance then
+        SetFloat("savegame.mod.pcomb.materials.stone.collapse_resistance", newStoneResistance)
+    end
+    UiTranslate(0, 40)
+
+    -- Metal Materials
+    UiFont("regular.ttf", 16)
+    UiColor(0.8, 0.8, 0.9)
+    UiText("Metal Materials")
+    UiTranslate(0, 25)
+    UiFont("regular.ttf", 14)
+    UiColor(1, 1, 1)
+    
+    UiText("Metal Density Multiplier")
+    UiTranslate(0, 25)
+    local metalDensity = GetFloat("savegame.mod.pcomb.materials.metal.density") or 7.8
+    local newMetalDensity = UiSliderWithValue("ui/common/dot.png", 360, 20, metalDensity, 5.0, 10.0, "%.2f")
+    if newMetalDensity ~= metalDensity then
+        SetFloat("savegame.mod.pcomb.materials.metal.density", newMetalDensity)
+    end
+    UiTranslate(0, 30)
+
+    UiText("Metal Collapse Resistance")
+    UiTranslate(0, 25)
+    local metalResistance = GetFloat("savegame.mod.pcomb.materials.metal.collapse_resistance") or 0.95
+    local newMetalResistance = UiSliderWithValue("ui/common/dot.png", 360, 20, metalResistance * 100, 90, 99, "%.1f") / 100
+    if newMetalResistance ~= metalResistance then
+        SetFloat("savegame.mod.pcomb.materials.metal.collapse_resistance", newMetalResistance)
+    end
+    UiTranslate(0, 40)
+
+    -- Material Interaction Settings
+    UiFont("regular.ttf", 16)
+    UiColor(1, 1, 0.8)
+    UiText("Material Interaction")
+    UiTranslate(0, 25)
+    UiFont("regular.ttf", 14)
+    UiColor(1, 1, 1)
+    
+    UiText("Material Compatibility Factor")
+    UiTranslate(0, 25)
+    local compatibility = GetFloat("savegame.mod.pcomb.materials.compatibility_factor") or 1.0
+    local newCompatibility = UiSliderWithValue("ui/common/dot.png", 360, 20, compatibility * 100, 50, 150, "%.1f") / 100
+    if newCompatibility ~= compatibility then
+        SetFloat("savegame.mod.pcomb.materials.compatibility_factor", newCompatibility)
+    end
+    UiTranslate(0, 30)
+
+    UiText("Multi-Directional Analysis")
+    UiTranslate(0, 25)
+    local multiDir = GetBool("savegame.mod.pcomb.materials.multi_directional") or true
+    if multiDir then
+        UiColor(0.2, 0.8, 0.2)
+        if UiTextButton("Enabled") then
+            SetBool("savegame.mod.pcomb.materials.multi_directional", false)
+        end
+    else
+        UiColor(0.8, 0.2, 0.2)
+        if UiTextButton("Disabled") then
+            SetBool("savegame.mod.pcomb.materials.multi_directional", true)
+        end
+    end
+    UiTranslate(0, 80)
+    UiColor(1, 1, 1)
 end
 
 function UiBoolOption(text, key, initialValue)
