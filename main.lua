@@ -307,6 +307,130 @@ PcombDetection = {
         return triggers
     end,
     
+    analyzeGravityCollapse = function(breakpoint, breaksize)
+        local collapseCandidates = {}
+        
+        -- Query for bodies that might need gravity collapse analysis
+        local min = {breakpoint[1] - breaksize * 2, breakpoint[2] - breaksize * 2, breakpoint[3] - breaksize * 2}
+        local max = {breakpoint[1] + breaksize * 2, breakpoint[2] + breaksize * 2, breakpoint[3] + breaksize * 2}
+        
+        QueryRequire("physical dynamic large")
+        local bodies = QueryAabbBodies(min, max)
+        
+        for i = 1, #bodies do
+            local body = bodies[i]
+            if IsBodyActive(body) and not IsBodyBroken(body) then
+                local collapseData = PcombDetection.analyzeBodySupport(body, breakpoint)
+                if collapseData.needsCollapse then
+                    collapseCandidates[body] = collapseData
+                end
+            end
+        end
+        
+        return collapseCandidates
+    end,
+    
+    analyzeBodySupport = function(body, impactPoint)
+        local bodyTransform = GetBodyTransform(body)
+        local bodyPos = bodyTransform.pos
+        local bodyMass = GetBodyMass(body)
+        
+        -- Get body bounds for support analysis
+        local bounds = GetBodyBounds(body)
+        if not bounds then return {needsCollapse = false} end
+        
+        -- Calculate center of mass and support points
+        local centerOfMass = GetBodyCenterOfMass(body)
+        local comWorldPos = TransformToParentPoint(bodyTransform, centerOfMass)
+        
+        -- Check for ground support (bodies below this one)
+        local supportBodies = PcombDetection.findSupportingBodies(body, bounds)
+        
+        -- Calculate total supporting mass and area
+        local totalSupportMass = 0
+        local totalSupportArea = 0
+        
+        for _, supportBody in ipairs(supportBodies) do
+            if IsBodyActive(supportBody) then
+                local supportMass = GetBodyMass(supportBody)
+                local supportBounds = GetBodyBounds(supportBody)
+                if supportBounds then
+                    -- Calculate overlapping area (simplified)
+                    local overlapArea = PcombDetection.calculateOverlapArea(bounds, supportBounds)
+                    totalSupportMass = totalSupportMass + supportMass
+                    totalSupportArea = totalSupportArea + overlapArea
+                end
+            end
+        end
+        
+        -- Calculate stability ratio
+        local stabilityRatio = 0
+        if totalSupportMass > 0 then
+            stabilityRatio = totalSupportMass / bodyMass
+        end
+        
+        -- Calculate support area ratio
+        local bodyBaseArea = (bounds[4] - bounds[1]) * (bounds[6] - bounds[3]) -- width * depth
+        local supportAreaRatio = totalSupportArea / bodyBaseArea
+        
+        -- Get gravity collapse threshold from settings
+        local collapseThreshold = GetFloat("savegame.mod.pcomb.ibsit.collapse_threshold")
+        
+        -- Determine if collapse is needed
+        local needsCollapse = false
+        local collapseStrength = 0
+        
+        if stabilityRatio < collapseThreshold * 0.5 or supportAreaRatio < collapseThreshold * 0.3 then
+            needsCollapse = true
+            collapseStrength = math.max(
+                (collapseThreshold - stabilityRatio) / collapseThreshold,
+                (collapseThreshold - supportAreaRatio) / collapseThreshold
+            )
+            collapseStrength = math.min(collapseStrength, 1.0)
+        end
+        
+        return {
+            needsCollapse = needsCollapse,
+            collapseStrength = collapseStrength,
+            stabilityRatio = stabilityRatio,
+            supportAreaRatio = supportAreaRatio,
+            centerOfMass = comWorldPos,
+            bodyMass = bodyMass,
+            supportBodies = supportBodies
+        }
+    end,
+    
+    findSupportingBodies = function(body, bounds)
+        local supportingBodies = {}
+        
+        -- Look for bodies below this one
+        local queryMin = {bounds[1] - 1, bounds[2] - 2, bounds[3] - 1}
+        local queryMax = {bounds[4] + 1, bounds[2] + 0.5, bounds[6] + 1}
+        
+        QueryRequire("physical")
+        local nearbyBodies = QueryAabbBodies(queryMin, queryMax)
+        
+        for _, nearbyBody in ipairs(nearbyBodies) do
+            if nearbyBody ~= body and IsBodyActive(nearbyBody) then
+                local nearbyBounds = GetBodyBounds(nearbyBody)
+                if nearbyBounds and nearbyBounds[5] >= bounds[2] - 0.1 then
+                    -- Body is at or above our base level
+                    table.insert(supportingBodies, nearbyBody)
+                end
+            end
+        end
+        
+        return supportingBodies
+    end,
+    
+    calculateOverlapArea = function(bounds1, bounds2)
+        -- Calculate overlapping area between two bounding boxes
+        local xOverlap = math.max(0, math.min(bounds1[4], bounds2[4]) - math.max(bounds1[1], bounds2[1]))
+        local zOverlap = math.max(0, math.min(bounds1[6], bounds2[6]) - math.max(bounds1[3], bounds2[3]))
+        
+        return xOverlap * zOverlap
+    end,
+    
     getBodyVoxelCount = function(body)
         local count = 0
         local shapes = GetBodyShapes(body)
@@ -357,6 +481,12 @@ PcombEffects = {
             if integrityLoss > 0 then
                 PcombEffects.createStructuralEffects(body, integrityLoss, analysisData.position)
             end
+        end
+        
+        -- Process gravity collapse if enabled
+        if GetBool("savegame.mod.pcomb.ibsit.gravity_collapse") then
+            local collapseCandidates = PcombDetection.analyzeGravityCollapse(analysisData.position, analysisData.size)
+            PcombEffects.processGravityCollapse(collapseCandidates)
         end
     end,
     
@@ -560,6 +690,65 @@ PcombEffects = {
                 (math.random() - 0.5) * 0.4
             }
             SpawnParticle(dustPos, velocity, dustLife)
+        end
+    end,
+    
+    processGravityCollapse = function(collapseCandidates)
+        for body, collapseData in pairs(collapseCandidates) do
+            if collapseData.needsCollapse and IsBodyActive(body) then
+                PcombEffects.applyGravityCollapse(body, collapseData)
+            end
+        end
+    end,
+    
+    applyGravityCollapse = function(body, collapseData)
+        local collapseStrength = collapseData.collapseStrength
+        local centerOfMass = collapseData.centerOfMass
+        local bodyMass = collapseData.bodyMass
+        
+        -- Calculate gravity force based on collapse strength
+        local gravityForce = bodyMass * 9.81 * collapseStrength * 2.0 -- Amplified for effect
+        
+        -- Apply downward force at center of mass
+        ApplyBodyImpulse(body, centerOfMass, {0, -gravityForce, 0})
+        
+        -- Add some random horizontal instability for more realistic collapse
+        local instability = collapseStrength * 0.3
+        local randomX = (math.random() - 0.5) * instability * bodyMass
+        local randomZ = (math.random() - 0.5) * instability * bodyMass
+        
+        ApplyBodyImpulse(body, centerOfMass, {randomX, 0, randomZ})
+        
+        -- Create dust particles for collapse effect
+        PcombEffects.createCollapseDust(centerOfMass, collapseStrength)
+        
+        -- Play collapse sound
+        PcombEffects.playCollapseSound(centerOfMass, collapseStrength)
+    end,
+    
+    createCollapseDust = function(position, intensity)
+        local dustCount = math.floor(intensity * 20) + 5
+        
+        for i = 1, dustCount do
+            local offset = {
+                (math.random() - 0.5) * 2,
+                math.random() * 0.5,
+                (math.random() - 0.5) * 2
+            }
+            local dustPos = VecAdd(position, offset)
+            
+            SpawnParticle(dustPos, {0, 0, 0}, 2.0)
+        end
+    end,
+    
+    playCollapseSound = function(position, intensity)
+        -- Play appropriate collapse sound based on intensity
+        if intensity > 0.7 then
+            PlaySound(LoadSound("sound/structure_collapse_heavy.ogg"), position, 1.0)
+        elseif intensity > 0.4 then
+            PlaySound(LoadSound("sound/structure_collapse_medium.ogg"), position, 0.8)
+        else
+            PlaySound(LoadSound("sound/structure_collapse_light.ogg"), position, 0.6)
         end
     end
 }
