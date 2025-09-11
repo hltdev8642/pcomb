@@ -339,7 +339,7 @@ function drawIBSITCoreTab()
     UiText("Momentum Threshold (2^value)")
     UiTranslate(0, 25)
     local momentumThreshold = GetInt("savegame.mod.pcomb.ibsit.momentum_threshold")
-    local newMomentumThreshold = UiSliderWithValue("ui/common/dot.png", 360, 20, momentumThreshold, 8, 20, "%.0f")
+    local newMomentumThreshold = UiSliderWithValue("ui/common/dot.png", 360, 20, momentumThreshold, 1, 20, "%.0f")
     if newMomentumThreshold ~= momentumThreshold then
         SetInt("savegame.mod.pcomb.ibsit.momentum_threshold", newMomentumThreshold)
     end
@@ -360,7 +360,7 @@ function drawIBSITAdvancedTab()
     UiText("Collapse Threshold")
     UiTranslate(0, 25)
     local collapseThreshold = GetFloat("savegame.mod.pcomb.ibsit.collapse_threshold")
-    local newCollapseThreshold = UiSliderWithValue("ui/common/dot.png", 360, 20, collapseThreshold * 100, 10, 100, "%.2f") / 100
+    local newCollapseThreshold = UiSliderWithValue("ui/common/dot.png", 360, 20, collapseThreshold * 100, 1, 100, "%.2f") / 100
     if newCollapseThreshold ~= collapseThreshold then
         SetFloat("savegame.mod.pcomb.ibsit.collapse_threshold", newCollapseThreshold)
     end
@@ -433,7 +433,7 @@ function drawMBCSTab()
     UiText("Mass Threshold (2^value)")
     UiTranslate(0, 25)
     local massThreshold = GetInt("savegame.mod.pcomb.mbcs.mass_threshold")
-    local newMassThreshold = UiSliderWithValue("ui/common/dot.png", 360, 20, massThreshold, 4, 16, "%.0f")
+    local newMassThreshold = UiSliderWithValue("ui/common/dot.png", 360, 20, massThreshold, 1, 16, "%.0f")
     if newMassThreshold ~= massThreshold then
         SetInt("savegame.mod.pcomb.mbcs.mass_threshold", newMassThreshold)
     end

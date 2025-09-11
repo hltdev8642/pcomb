@@ -386,18 +386,32 @@ PcombEffects = {
         for i = 1, holeCount do
             local shape = shapes[math.random(#shapes)]
             local bounds = GetShapeBounds(shape)
-            local holePos = {
-                math.random() * (bounds[4] - bounds[1]) + bounds[1],
-                math.random() * (bounds[5] - bounds[2]) + bounds[2], 
-                math.random() * (bounds[6] - bounds[3]) + bounds[3]
-            }
             
-            local sizeMultiplier = (crumbleSize / 500) * (0.8 + math.random() * 0.4)
-            local woodDamage = lightDamage * (mass * 0.008) * sizeMultiplier
-            local stoneDamage = mediumDamage * (mass * 0.008) * sizeMultiplier
-            local metalDamage = heavyDamage * (mass * 0.008) * sizeMultiplier
-            
-            MakeHole(holePos, woodDamage, stoneDamage, metalDamage)
+            -- Validate bounds to prevent nil arithmetic errors
+            if bounds and type(bounds) == "table" and #bounds >= 6 then
+                local allValid = true
+                for j = 1, 6 do
+                    if not bounds[j] or type(bounds[j]) ~= "number" then
+                        allValid = false
+                        break
+                    end
+                end
+                
+                if allValid then
+                    local holePos = {
+                        math.random() * (bounds[4] - bounds[1]) + bounds[1],
+                        math.random() * (bounds[5] - bounds[2]) + bounds[2], 
+                        math.random() * (bounds[6] - bounds[3]) + bounds[3]
+                    }
+                    
+                    local sizeMultiplier = (crumbleSize / 500) * (0.8 + math.random() * 0.4)
+                    local woodDamage = lightDamage * (mass * 0.008) * sizeMultiplier
+                    local stoneDamage = mediumDamage * (mass * 0.008) * sizeMultiplier
+                    local metalDamage = heavyDamage * (mass * 0.008) * sizeMultiplier
+                    
+                    MakeHole(holePos, woodDamage, stoneDamage, metalDamage)
+                end
+            end
         end
     end,
     
@@ -484,19 +498,33 @@ PcombEffects = {
         for i = 1, #shapes do
             local shape = shapes[i]
             local shapeBounds = GetShapeBounds(shape)
-            local center = {
-                (shapeBounds[1] + shapeBounds[4]) / 2,
-                (shapeBounds[2] + shapeBounds[5]) / 2,
-                (shapeBounds[3] + shapeBounds[6]) / 2
-            }
             
-            local damageMultiplier = triggerData.triggerStrength * 0.5
-            
-            MakeHole(center, 
-                woodDamage * damageMultiplier,
-                stoneDamage * damageMultiplier, 
-                metalDamage * damageMultiplier
-            )
+            -- Validate shapeBounds to prevent nil arithmetic errors
+            if shapeBounds and type(shapeBounds) == "table" and #shapeBounds >= 6 then
+                local allValid = true
+                for j = 1, 6 do
+                    if not shapeBounds[j] or type(shapeBounds[j]) ~= "number" then
+                        allValid = false
+                        break
+                    end
+                end
+                
+                if allValid then
+                    local center = {
+                        (shapeBounds[1] + shapeBounds[4]) / 2,
+                        (shapeBounds[2] + shapeBounds[5]) / 2,
+                        (shapeBounds[3] + shapeBounds[6]) / 2
+                    }
+                    
+                    local damageMultiplier = triggerData.triggerStrength * 0.5
+                    
+                    MakeHole(center, 
+                        woodDamage * damageMultiplier,
+                        stoneDamage * damageMultiplier, 
+                        metalDamage * damageMultiplier
+                    )
+                end
+            end
         end
     end,
     
@@ -612,7 +640,6 @@ function tick(dt)
     -- Handle pause menu
     if PauseMenuButton("Physics Combo") then
         pauseMenuEnabled = not pauseMenuEnabled
-        SetPaused(false)
     end
     
     -- Only process physics if systems are running
