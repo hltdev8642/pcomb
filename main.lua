@@ -1990,7 +1990,10 @@ function draw(dt)
             UiTranslate(0, -50 + (i - 1) * 40)
             UiButtonImageBox("ui/common/box-outline-6.png", 6, 6)
             
+            -- Read current state
             local isEnabled = GetBool(button.key)
+            local buttonClicked = false
+            
             if isEnabled then
                 UiColor(0.2, 0.8, 0.2)
             else
@@ -1998,8 +2001,25 @@ function draw(dt)
             end
             
             if UiTextButton(button.name .. " (" .. (isEnabled and "ON" or "OFF") .. ")", 300, 35) then
-                SetBool(button.key, not isEnabled)
+                buttonClicked = true
+                -- Toggle the value
+                local newValue = not isEnabled
+                SetBool(button.key, newValue)
+                -- Update local state for immediate visual feedback
+                isEnabled = newValue
             end
+            
+            -- Update button appearance immediately if clicked
+            if buttonClicked then
+                if isEnabled then
+                    UiColor(0.2, 0.8, 0.2)
+                else
+                    UiColor(0.8, 0.2, 0.2)
+                end
+                -- Redraw button with updated state (this ensures immediate visual feedback)
+                UiText(button.name .. " (" .. (isEnabled and "ON" or "OFF") .. ")")
+            end
+            
             UiPop()
         end
         

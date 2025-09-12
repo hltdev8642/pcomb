@@ -758,18 +758,43 @@ function drawMaterialsTab()
     
     UiText("Enable Impact Damage")
     UiTranslate(0, 25)
-    local impactEnabled = GetBool("savegame.mod.pcomb.impact.enabled") or true
+    
+    -- Read current state from registry
+    local impactEnabled = GetBool("savegame.mod.pcomb.impact.enabled")
+    local buttonClicked = false
+    local newImpactEnabled = impactEnabled
+    
     if impactEnabled then
         UiColor(0.2, 0.8, 0.2)
         if UiTextButton("Enabled") then
-            SetBool("savegame.mod.pcomb.impact.enabled", false)
+            buttonClicked = true
+            newImpactEnabled = false
+            SetBool("savegame.mod.pcomb.impact.enabled", newImpactEnabled)
         end
     else
         UiColor(0.8, 0.2, 0.2)
         if UiTextButton("Disabled") then
-            SetBool("savegame.mod.pcomb.impact.enabled", true)
+            buttonClicked = true
+            newImpactEnabled = true
+            SetBool("savegame.mod.pcomb.impact.enabled", newImpactEnabled)
         end
     end
+    
+    -- If button was clicked, provide immediate visual feedback by redrawing with new state
+    if buttonClicked then
+        UiTranslate(0, -25)  -- Move back up to redraw the button
+        UiText("Enable Impact Damage")
+        UiTranslate(0, 25)
+        
+        if newImpactEnabled then
+            UiColor(0.2, 0.8, 0.2)
+            UiText("Enabled")
+        else
+            UiColor(0.8, 0.2, 0.2)
+            UiText("Disabled")
+        end
+    end
+    
     UiTranslate(0, 30)
 
     UiText("Impact Damage Multiplier")
@@ -795,23 +820,46 @@ end
 function UiBoolOption(text, key, initialValue)
     UiText(text)
     UiTranslate(0, 35)
-    local returnValue = initialValue
-    if initialValue then
+    
+    -- Read current state from registry
+    local currentValue = GetBool(key)
+    local buttonClicked = false
+    local newValue = currentValue
+    
+    if currentValue then
         UiColor(0.467, 0.867, 0.467) -- Green
         if UiTextButton("Enabled") then
-            returnValue = false
-            SetBool(key, returnValue)
+            buttonClicked = true
+            newValue = false
+            SetBool(key, newValue)
         end
     else
         UiColor(0.910, 0.420, 0.302) -- Red
         if UiTextButton("Disabled") then
-            returnValue = true
-            SetBool(key, returnValue)
+            buttonClicked = true
+            newValue = true
+            SetBool(key, newValue)
         end
     end
+    
+    -- If button was clicked, provide immediate visual feedback by redrawing with new state
+    if buttonClicked then
+        UiTranslate(0, -35)  -- Move back up to redraw the button
+        UiText(text)
+        UiTranslate(0, 35)
+        
+        if newValue then
+            UiColor(0.467, 0.867, 0.467) -- Green
+            UiText("Enabled")
+        else
+            UiColor(0.910, 0.420, 0.302) -- Red
+            UiText("Disabled")
+        end
+    end
+    
     UiTranslate(0, 80)
     UiColor(1, 1, 1)
-    return returnValue
+    return newValue
 end
 
 -- Slider helper that shows numeric value to the right without changing outer layout
