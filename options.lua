@@ -746,6 +746,48 @@ function drawMaterialsTab()
             SetBool("savegame.mod.pcomb.materials.multi_directional", true)
         end
     end
+    UiTranslate(0, 40)
+
+    -- Impact Damage Settings
+    UiFont("regular.ttf", 16)
+    UiColor(1, 0.5, 0.5)
+    UiText("Impact Damage System")
+    UiTranslate(0, 25)
+    UiFont("regular.ttf", 14)
+    UiColor(1, 1, 1)
+    
+    UiText("Enable Impact Damage")
+    UiTranslate(0, 25)
+    local impactEnabled = GetBool("savegame.mod.pcomb.impact.enabled") or true
+    if impactEnabled then
+        UiColor(0.2, 0.8, 0.2)
+        if UiTextButton("Enabled") then
+            SetBool("savegame.mod.pcomb.impact.enabled", false)
+        end
+    else
+        UiColor(0.8, 0.2, 0.2)
+        if UiTextButton("Disabled") then
+            SetBool("savegame.mod.pcomb.impact.enabled", true)
+        end
+    end
+    UiTranslate(0, 30)
+
+    UiText("Impact Damage Multiplier")
+    UiTranslate(0, 25)
+    local impactMultiplier = GetFloat("savegame.mod.pcomb.impact.multiplier") or 1.0
+    local newImpactMultiplier = UiSliderWithValue("ui/common/dot.png", 360, 20, impactMultiplier * 100, 10, 300, "%.1f") / 100
+    if newImpactMultiplier ~= impactMultiplier then
+        SetFloat("savegame.mod.pcomb.impact.multiplier", newImpactMultiplier)
+    end
+    UiTranslate(0, 30)
+
+    UiText("Impact Radius")
+    UiTranslate(0, 25)
+    local impactRadius = GetFloat("savegame.mod.pcomb.impact.radius") or 2.0
+    local newImpactRadius = UiSliderWithValue("ui/common/dot.png", 360, 20, impactRadius * 10, 5, 50, "%.1f") / 10
+    if newImpactRadius ~= impactRadius then
+        SetFloat("savegame.mod.pcomb.impact.radius", newImpactRadius)
+    end
     UiTranslate(0, 80)
     UiColor(1, 1, 1)
 end

@@ -415,9 +415,22 @@ PcombDetection = {
     end,
     
     analyzeBodySupport = function(body, impactPoint)
+        -- NEW: Convert static bodies to dynamic before analysis
+        -- This ensures bodies can participate in physics simulation for collapse/impact
+        if PcombDetection.isBodyStatic(body) then
+            local converted = PcombDetection.convertStaticToDynamic(body)
+            if not converted then
+                -- If conversion failed, skip analysis for this body
+                return {needsCollapse = false, conversionFailed = true}
+            end
+        end
+        
         local bodyTransform = GetBodyTransform(body)
         local bodyPos = bodyTransform.pos
         local bodyMass = GetBodyMass(body)
+        if not bodyMass then
+            return {needsCollapse = false}
+        end
         
         -- Get body bounds for support analysis
         local bounds = GetBodyBounds(body)
@@ -453,22 +466,55 @@ PcombDetection = {
             math.min(stabilityRatio, supportAreaRatio)
         )
         
+        -- NEW: Minimum support area threshold based on body weight
+        local minSupportAreaRatio = PcombDetection.calculateMinimumSupportArea(body, materialProps, effectiveMass)
+        
+        -- NEW: Check for minimal connections that shouldn't prevent collapse
+        local hasMinimalSupport = PcombDetection.checkMinimalSupport(supportAnalysis, bounds, materialProps)
+        
+        -- NEW: Enhanced torque-based stability analysis
+        local stabilityAnalysis = PcombDetection.checkRotationalStability(body, supportAnalysis, materialProps)
+        
+        -- NEW: Apply progressive failure if needed
+        local progressiveFailureApplied = false
+        if not stabilityAnalysis.isStable then
+            progressiveFailureApplied = PcombDetection.applyProgressiveFailure(body, stabilityAnalysis, materialProps)
+        end
+        
+        -- Enhanced collapse criteria with torque analysis
+        local torqueBasedCollapse = false
+        local torqueCollapseStrength = 0
+        
+        if not stabilityAnalysis.isStable then
+            -- Calculate collapse strength based on torque ratio
+            torqueCollapseStrength = math.max(0, 1 - stabilityAnalysis.torqueRatio)
+            torqueBasedCollapse = true
+            
+            if GetBool("savegame.mod.pcomb.global.debug") then
+                DebugPrint("Torque-based collapse detected: " .. stabilityAnalysis.collapseDirection .. 
+                          " (ratio: " .. string.format("%.2f", stabilityAnalysis.torqueRatio) .. ")")
+            end
+        end
+        
         -- Determine if collapse is needed
         local needsCollapse = false
         local collapseStrength = 0
         
-        -- Multiple collapse criteria
+        -- Multiple collapse criteria with improved weight consideration
         if stabilityRatio < materialAdjustedThreshold * 0.6 or 
-           supportAreaRatio < materialAdjustedThreshold * 0.4 or
+           supportAreaRatio < minSupportAreaRatio or  -- Use minimum support area threshold
            collapseProbability > 0.3 or
-           stressFactor > materialProps.strength * 0.8 then
-            
+           stressFactor > materialProps.strength * 0.8 or
+           hasMinimalSupport or  -- Check for minimal connections
+           torqueBasedCollapse then  -- NEW: Include torque-based collapse
+           
             needsCollapse = true
             collapseStrength = math.max(
                 (materialAdjustedThreshold - stabilityRatio) / materialAdjustedThreshold,
                 (materialAdjustedThreshold - supportAreaRatio) / materialAdjustedThreshold,
                 collapseProbability,
-                stressFactor / materialProps.strength
+                stressFactor / materialProps.strength,
+                torqueCollapseStrength  -- NEW: Include torque-based strength
             )
             collapseStrength = math.min(collapseStrength, 1.0)
         end
@@ -486,7 +532,11 @@ PcombDetection = {
             supportBodies = supportAnalysis.supportingBodies,
             loadFactor = loadFactor,
             stressFactor = stressFactor,
-            collapseProbability = collapseProbability
+            collapseProbability = collapseProbability,
+            -- NEW: Include torque analysis results
+            stabilityAnalysis = stabilityAnalysis,
+            progressiveFailureApplied = progressiveFailureApplied,
+            torqueCollapseStrength = torqueCollapseStrength
         }
     end,
     
@@ -711,6 +761,9 @@ PcombDetection = {
         if #supportingBodies == 0 then return 1.0 end
         
         local bodyMass = GetBodyMass(body)
+        if not bodyMass then
+            return 1.0
+        end
         local totalSupportMass = 0
         
         for _, supportBody in ipairs(supportingBodies) do
@@ -726,6 +779,9 @@ PcombDetection = {
     
     calculateStressFactor = function(body, supportAnalysis)
         local bodyMass = GetBodyMass(body)
+        if not bodyMass then
+            return 0
+        end
         local bodyBounds = GetBodyBounds(body)
         
         -- ADD: Validate bodyBounds to prevent nil arithmetic errors
@@ -746,11 +802,317 @@ PcombDetection = {
         local supportQuality = supportAnalysis.totalSupportArea / math.max(supportAnalysis.bodyBaseArea, 0.1)
         
         return stressPerArea / math.max(supportQuality, 0.1)
+    end,
+    
+    -- NEW: Calculate minimum support area required based on body weight and material
+    calculateMinimumSupportArea = function(body, materialProps, effectiveMass)
+        local bodyBounds = GetBodyBounds(body)
+        if not bodyBounds or type(bodyBounds) ~= "table" or #bodyBounds < 6 then
+            return 0.1 -- Default minimum
+        end
+        
+        local baseArea = (bodyBounds[4] - bodyBounds[1]) * (bodyBounds[6] - bodyBounds[3])
+        if baseArea <= 0 then return 0.1 end
+        
+        -- Minimum support area scales with mass and material properties
+        -- Heavier materials need more support, brittle materials need more stable support
+        local massFactor = math.min(effectiveMass / 1000, 5) -- Cap at 5x for very heavy objects
+        local materialFactor = 1 + (1 - materialProps.collapseResistance) * 0.5 -- Brittle materials need more support
+        
+        -- Minimum support area is 15-40% of base area depending on weight/material
+        local minSupportRatio = 0.15 + (massFactor * materialFactor * 0.05)
+        return math.min(minSupportRatio, 0.6) -- Cap at 60% to prevent impossible requirements
+    end,
+    
+    -- NEW: Check if body has only minimal connections that shouldn't prevent collapse
+    checkMinimalSupport = function(supportAnalysis, bounds, materialProps)
+        if #supportAnalysis.supportingBodies == 0 then return true end
+        
+        -- Calculate total support dimensions
+        local totalSupportWidth = 0
+        local totalSupportDepth = 0
+        
+        for _, supportBody in ipairs(supportAnalysis.supportingBodies) do
+            if IsBodyActive(supportBody) then
+                local supportBounds = GetBodyBounds(supportBody)
+                if supportBounds then
+                    -- Calculate overlap dimensions
+                    local overlapWidth = math.max(0, math.min(bounds[4], supportBounds[4]) - math.max(bounds[1], supportBounds[1]))
+                    local overlapDepth = math.max(0, math.min(bounds[6], supportBounds[6]) - math.max(bounds[3], supportBounds[3]))
+                    
+                    totalSupportWidth = totalSupportWidth + overlapWidth
+                    totalSupportDepth = totalSupportDepth + overlapDepth
+                end
+            end
+        end
+        
+        -- Body dimensions
+        local bodyWidth = bounds[4] - bounds[1]
+        local bodyDepth = bounds[6] - bounds[3]
+        
+        -- Check if support is minimal (less than 20% of body dimensions)
+        local widthSupportRatio = totalSupportWidth / math.max(bodyWidth, 0.1)
+        local depthSupportRatio = totalSupportDepth / math.max(bodyDepth, 0.1)
+        
+        -- If support is very minimal in either dimension, body should collapse
+        local minimalThreshold = 0.2 -- 20% minimum support
+        local isMinimalSupport = widthSupportRatio < minimalThreshold or depthSupportRatio < minimalThreshold
+        
+        -- Additional check: if total support area is less than 10% of body base area
+        local bodyBaseArea = bodyWidth * bodyDepth
+        local supportAreaRatio = supportAnalysis.totalSupportArea / math.max(bodyBaseArea, 0.1)
+        local isVeryMinimalSupport = supportAreaRatio < 0.1
+        
+        return isMinimalSupport or isVeryMinimalSupport
+    end,
+    
+    -- NEW: Check if a body is static and needs conversion to dynamic
+    isBodyStatic = function(body)
+        -- In Teardown, static bodies don't participate in physics simulation
+        -- We can check this by seeing if the body has any dynamic behavior
+        if not IsBodyActive(body) then return true end
+        
+        -- Check if body is marked as static (this is engine-specific)
+        -- Try to detect static bodies by their behavior characteristics
+        local velocity = GetBodyVelocity(body)
+        local angularVelocity = GetBodyAngularVelocity(body)
+        
+        -- Static bodies typically have zero velocity and don't respond to forces
+        -- Also check if body is kinematic (controlled by animation/script)
+        local isKinematic = GetBodyMass(body) < 0.01 -- Very light bodies might be kinematic
+        
+        return (VecLength(velocity) < 0.001 and VecLength(angularVelocity) < 0.001) or isKinematic
+    end,
+    
+    -- NEW: Convert a static body to dynamic so it can participate in physics
+    convertStaticToDynamic = function(body)
+        if not PcombDetection.isBodyStatic(body) then return false end
+        
+        -- Enable physics simulation for this body
+        SetBodyActive(body, true)
+        
+        -- Ensure the body has proper mass for physics calculations
+        local currentMass = GetBodyMass(body)
+        if currentMass and currentMass < 1.0 then
+            -- Set minimum mass for dynamic behavior
+            SetBodyMass(body, 1.0)
+        end
+        
+        -- Reset any kinematic constraints that might prevent physics
+        -- This ensures the body can now fall and interact with other bodies
+        
+        if GetBool("savegame.mod.pcomb.global.debug") then
+            DebugPrint("Converted static body to dynamic: " .. tostring(body))
+        end
+        
+        return true
+    end,
+    
+    -- NEW: Calculate torque (rotational force) using T = F × d formula
+    -- Torque = Force × Distance from center of mass to force application point
+    calculateTorque = function(force, centerOfMass, forcePoint)
+        -- Calculate vector from center of mass to force application point
+        local r = {
+            forcePoint[1] - centerOfMass[1],
+            forcePoint[2] - centerOfMass[2], 
+            forcePoint[3] - centerOfMass[3]
+        }
+        
+        -- Calculate torque using cross product: T = r × F
+        -- For 2D stability analysis, we focus on the torque that causes rotation around the support axis
+        local torqueX = r[2] * force[3] - r[3] * force[2]  -- Rotation around X-axis
+        local torqueY = r[3] * force[1] - r[1] * force[3]  -- Rotation around Y-axis  
+        local torqueZ = r[1] * force[2] - r[2] * force[1]  -- Rotation around Z-axis
+        
+        -- Return the magnitude of torque that would cause tipping
+        -- For stability analysis, we typically care about the torque around the axis perpendicular to gravity
+        return math.sqrt(torqueX*torqueX + torqueZ*torqueZ)  -- Horizontal torque magnitude
+    end,
+    
+    -- NEW: Calculate center of mass for a body
+    calculateCenterOfMass = function(body)
+        -- Try to get center of mass from Teardown API first
+        local com = GetBodyCenterOfMass(body)
+        if com then
+            return com
+        end
+        
+        -- Fallback: calculate approximate center of mass from body bounds
+        local bounds = GetBodyBounds(body)
+        if not bounds or type(bounds) ~= "table" or #bounds < 6 then
+            return {0, 0, 0}  -- Default fallback
+        end
+        
+        -- Calculate geometric center as approximation
+        local centerX = (bounds[1] + bounds[4]) / 2
+        local centerY = (bounds[2] + bounds[5]) / 2
+        local centerZ = (bounds[3] + bounds[6]) / 2
+        
+        return {centerX, centerY, centerZ}
+    end,
+    
+    -- NEW: Analyze weight distribution and calculate stability
+    analyzeWeightDistribution = function(body, supportPoints)
+        local bodyMass = GetBodyMass(body)
+        local centerOfMass = PcombDetection.calculateCenterOfMass(body)
+        local gravityForce = {0, -bodyMass * 9.81, 0}  -- Gravity force vector
+        
+        -- Calculate torque from gravity around each potential pivot point
+        local stabilityAnalysis = {
+            pivotTorques = {},
+            minStabilityTorque = math.huge,
+            maxStabilityTorque = 0,
+            centerOfMass = centerOfMass,
+            totalWeightTorque = 0
+        }
+        
+        for i, supportPoint in ipairs(supportPoints) do
+            local torque = PcombDetection.calculateTorque(gravityForce, centerOfMass, supportPoint)
+            stabilityAnalysis.pivotTorques[i] = {
+                point = supportPoint,
+                torque = torque
+            }
+            
+            stabilityAnalysis.minStabilityTorque = math.min(stabilityAnalysis.minStabilityTorque, torque)
+            stabilityAnalysis.maxStabilityTorque = math.max(stabilityAnalysis.maxStabilityTorque, torque)
+        end
+        
+        -- Calculate total weight distribution torque (sum of all support torques)
+        for _, pivotData in ipairs(stabilityAnalysis.pivotTorques) do
+            stabilityAnalysis.totalWeightTorque = stabilityAnalysis.totalWeightTorque + pivotData.torque
+        end
+        
+        return stabilityAnalysis
+    end,
+    
+    -- NEW: Check rotational stability based on torque analysis
+    checkRotationalStability = function(body, supportAnalysis, materialProps)
+        if #supportAnalysis.supportingBodies == 0 then
+            return {isStable = false, collapseDirection = "freefall", torqueRatio = 0}
+        end
+        
+        -- Get support points from supporting bodies
+        local supportPoints = {}
+        for _, supportBody in ipairs(supportAnalysis.supportingBodies) do
+            local supportBounds = GetBodyBounds(supportBody)
+            if supportBounds then
+                -- Use the top surface of the supporting body as contact point
+                local contactPoint = {
+                    (supportBounds[1] + supportBounds[4]) / 2,  -- Center X
+                    supportBounds[5],  -- Top Y
+                    (supportBounds[3] + supportBounds[6]) / 2   -- Center Z
+                }
+                table.insert(supportPoints, contactPoint)
+            end
+        end
+        
+        if #supportPoints == 0 then
+            return {isStable = false, collapseDirection = "freefall", torqueRatio = 0}
+        end
+        
+        -- Analyze weight distribution
+        local weightAnalysis = PcombDetection.analyzeWeightDistribution(body, supportPoints)
+        
+        -- Calculate stability metrics
+        local bodyBounds = GetBodyBounds(body)
+        local bodyHeight = bodyBounds[5] - bodyBounds[2]
+        local bodyMass = GetBodyMass(body)
+        
+        -- Material-specific stability factors
+        local materialStabilityFactor = materialProps.collapseResistance
+        local brittlenessFactor = 1 - materialStabilityFactor  -- Brittle materials are less stable
+        
+        -- Calculate stability ratio: support torque vs weight torque
+        local stabilityRatio = weightAnalysis.minStabilityTorque / (bodyMass * bodyHeight * brittlenessFactor)
+        
+        -- Determine if body is stable
+        local stabilityThreshold = 0.3 * materialStabilityFactor  -- Lower threshold for brittle materials
+        local isStable = stabilityRatio > stabilityThreshold
+        
+        -- Determine collapse direction based on weakest support
+        local collapseDirection = "balanced"
+        if not isStable then
+            -- Find the direction with minimum support
+            local minTorqueIndex = 1
+            for i, pivotData in ipairs(weightAnalysis.pivotTorques) do
+                if pivotData.torque < weightAnalysis.pivotTorques[minTorqueIndex].torque then
+                    minTorqueIndex = i
+                end
+            end
+            
+            -- Determine collapse direction based on center of mass relative to support
+            local weakestPoint = weightAnalysis.pivotTorques[minTorqueIndex].point
+            local comToSupport = {
+                weightAnalysis.centerOfMass[1] - weakestPoint[1],
+                weightAnalysis.centerOfMass[3] - weakestPoint[3]
+            }
+            
+            if math.abs(comToSupport[1]) > math.abs(comToSupport[2]) then
+                collapseDirection = comToSupport[1] > 0 and "east" or "west"
+            else
+                collapseDirection = comToSupport[2] > 0 and "north" or "south"
+            end
+        end
+        
+        return {
+            isStable = isStable,
+            collapseDirection = collapseDirection,
+            torqueRatio = stabilityRatio,
+            weightAnalysis = weightAnalysis,
+            materialFactor = brittlenessFactor
+        }
+    end,
+    
+    -- NEW: Implement progressive failure mechanics
+    applyProgressiveFailure = function(body, stabilityAnalysis, materialProps)
+        if stabilityAnalysis.isStable then return false end
+        
+        -- NEW: Check if weightAnalysis exists to prevent nil access errors
+        if not stabilityAnalysis.weightAnalysis or not stabilityAnalysis.weightAnalysis.pivotTorques then
+            return false
+        end
+        
+        local bodyMass = GetBodyMass(body)
+        local failureApplied = false
+        
+        -- Calculate failure strength based on material properties
+        local baseFailureStrength = materialProps.strength * 1000  -- Convert MPa to appropriate units
+        local materialFailureMultiplier = 1 - materialProps.collapseResistance
+        
+        -- Apply progressive damage to weakest connections
+        for _, pivotData in ipairs(stabilityAnalysis.weightAnalysis.pivotTorques) do
+            local connectionStrength = baseFailureStrength * materialFailureMultiplier
+            local appliedTorque = pivotData.torque
+            
+            -- If torque exceeds connection strength, apply damage
+            if appliedTorque > connectionStrength then
+                -- Calculate damage amount based on torque excess
+                local damageRatio = (appliedTorque - connectionStrength) / connectionStrength
+                local damageAmount = math.min(damageRatio * 2.0, 5.0)  -- Cap damage
+                
+                -- Apply damage at connection point
+                local woodDamage = damageAmount * GetInt("savegame.mod.pcomb.ibsit.wood_damage") / 100
+                local stoneDamage = damageAmount * GetInt("savegame.mod.pcomb.ibsit.stone_damage") / 100
+                local metalDamage = damageAmount * GetInt("savegame.mod.pcomb.ibsit.metal_damage") / 100
+                
+                MakeHole(pivotData.point, woodDamage, stoneDamage, metalDamage)
+                failureApplied = true
+                
+                if GetBool("savegame.mod.pcomb.global.debug") then
+                    DebugPrint("Applied progressive failure damage: " .. damageAmount .. " at connection point")
+                end
+            end
+        end
+        
+        return failureApplied
     end
 }
 
 -- Effects and Visual Systems Module
 PcombEffects = {
+    -- Track falling bodies for impact damage
+    fallingBodies = {},
+    
     processEffects = function(analysisData)
         -- Process PRGD effects
         if systems.prgd.enabled and systems.prgd.initialized then
@@ -766,6 +1128,9 @@ PcombEffects = {
         if systems.mbcs.enabled and systems.mbcs.initialized then
             PcombEffects.processMBCSEffects(analysisData)
         end
+        
+        -- Process impact damage for falling bodies
+        PcombEffects.processImpactDamage()
     end,
     
     processPRGDEffects = function(analysisData)
@@ -1010,9 +1375,25 @@ PcombEffects = {
     end,
     
     applyGravityCollapse = function(body, collapseData)
+        -- NEW: Ensure body is dynamic before applying gravity forces
+        -- This is a final safety check in case static conversion was missed earlier
+        if PcombDetection.isBodyStatic(body) then
+            local converted = PcombDetection.convertStaticToDynamic(body)
+            if not converted then
+                -- If conversion failed, skip gravity application
+                if GetBool("savegame.mod.pcomb.global.debug") then
+                    DebugPrint("Failed to convert static body for gravity collapse: " .. tostring(body))
+                end
+                return
+            end
+        end
+        
         local collapseStrength = collapseData.collapseStrength
         local centerOfMass = collapseData.centerOfMass
         local bodyMass = collapseData.effectiveMass or collapseData.bodyMass
+        if not bodyMass then
+            return
+        end
         local materialProps = collapseData.materialProps
         
         -- Material-specific gravity force calculation
@@ -1024,8 +1405,35 @@ PcombEffects = {
         local materialFactor = 1 + (1 - materialProps.collapseResistance) * 2.0
         local gravityForce = bodyMass * baseGravity * collapseStrength * materialMultiplier * materialFactor
         
-        -- Apply downward force at center of mass
-        ApplyBodyImpulse(body, centerOfMass, {0, -gravityForce, 0})
+        -- NEW: Enhanced directional collapse based on torque analysis
+        local directionalForces = {0, -gravityForce, 0}  -- Default downward force
+        
+        if collapseData.stabilityAnalysis and not collapseData.stabilityAnalysis.isStable then
+            -- Apply directional forces based on collapse direction
+            local collapseDirection = collapseData.stabilityAnalysis.collapseDirection
+            local torqueStrength = collapseData.torqueCollapseStrength or 0.5
+            
+            -- Calculate directional force magnitude based on torque
+            local directionalMagnitude = gravityForce * torqueStrength * 0.3
+            
+            if collapseDirection == "east" then
+                directionalForces = {directionalMagnitude, -gravityForce, 0}
+            elseif collapseDirection == "west" then
+                directionalForces = {-directionalMagnitude, -gravityForce, 0}
+            elseif collapseDirection == "north" then
+                directionalForces = {0, -gravityForce, directionalMagnitude}
+            elseif collapseDirection == "south" then
+                directionalForces = {0, -gravityForce, -directionalMagnitude}
+            end
+            
+            if GetBool("savegame.mod.pcomb.global.debug") then
+                DebugPrint("Directional collapse: " .. collapseDirection .. 
+                          " (torque strength: " .. string.format("%.2f", torqueStrength) .. ")")
+            end
+        end
+        
+        -- Apply the calculated forces
+        ApplyBodyImpulse(body, centerOfMass, directionalForces)
         
         -- Material-specific instability (brittle materials are more unstable)
         local instability = collapseStrength * (1 - materialProps.collapseResistance) * 0.5
@@ -1035,6 +1443,9 @@ PcombEffects = {
         if instability > 0.1 then
             ApplyBodyImpulse(body, centerOfMass, {randomX, 0, randomZ})
         end
+        
+        -- NEW: Track this body as falling for impact damage
+        PcombEffects.trackFallingBody(body, collapseData)
         
         -- Material-specific effects
         if materialProps.name == "Glass" or materialProps.name == "Window Glass" then
@@ -1194,6 +1605,240 @@ PcombEffects = {
         else
             -- Default collapse sound
             PcombEffects.playCollapseSound(position, intensity)
+        end
+    end,
+    
+    -- NEW: Track falling body for impact damage calculation
+    trackFallingBody = function(body, collapseData)
+        -- NEW: Ensure body is dynamic before tracking for impact damage
+        if PcombDetection.isBodyStatic(body) then
+            local converted = PcombDetection.convertStaticToDynamic(body)
+            if not converted then
+                -- If conversion failed, don't track this body
+                return
+            end
+        end
+        
+        if not IsBodyActive(body) then return end
+        
+        local bodyVelocity = GetBodyVelocity(body)
+        local verticalVelocity = math.abs(bodyVelocity[2])
+        if not verticalVelocity then
+            return
+        end
+
+        -- Only track bodies with significant downward velocity
+        if verticalVelocity > 2.0 then
+            PcombEffects.fallingBodies[body] = {
+                startTime = GetTime(),
+                initialVelocity = bodyVelocity,
+                initialPosition = GetBodyTransform(body).pos,
+                materialProps = collapseData.materialProps,
+                effectiveMass = collapseData.effectiveMass or collapseData.bodyMass,
+                lastVelocity = bodyVelocity,
+                maxVelocity = verticalVelocity,
+                hasImpacted = false
+            }
+        end
+    end,
+    
+    -- NEW: Process impact damage for tracked falling bodies
+    processImpactDamage = function()
+        local currentTime = GetTime()
+        
+        for body, fallData in pairs(PcombEffects.fallingBodies) do
+            if not IsBodyActive(body) then
+                -- Body was destroyed, remove from tracking
+                PcombEffects.fallingBodies[body] = nil
+            elseif not fallData.hasImpacted then
+                local currentVelocity = GetBodyVelocity(body)
+                local verticalVelocity = math.abs(currentVelocity[2])
+                
+                -- Update max velocity
+                if verticalVelocity > fallData.maxVelocity then
+                    fallData.maxVelocity = verticalVelocity
+                end
+                
+                -- Check for impact (significant velocity reduction or direction change)
+                local velocityChange = math.abs(verticalVelocity - math.abs(fallData.lastVelocity[2]))
+                
+                -- Detect impact: either velocity suddenly drops or body stops moving downward
+                if velocityChange > 3.0 or (verticalVelocity < 1.0 and currentVelocity[2] > -0.5) then
+                    -- Calculate impact force and apply damage
+                    PcombEffects.applyImpactDamage(body, fallData, currentVelocity)
+                    fallData.hasImpacted = true
+                    
+                    -- Remove from tracking after a short delay
+                    fallData.removeTime = currentTime + 2.0
+                else
+                    fallData.lastVelocity = currentVelocity
+                end
+            elseif fallData.removeTime and currentTime > fallData.removeTime then
+                -- Remove old impacted bodies
+                PcombEffects.fallingBodies[body] = nil
+            end
+        end
+    end,
+    
+    -- NEW: Apply damage based on impact force
+    applyImpactDamage = function(body, fallData, impactVelocity)
+        -- Check if impact damage is enabled
+        if not GetBool("savegame.mod.pcomb.impact.enabled") then return end
+        
+        local impactPosition = GetBodyTransform(body).pos
+        local impactForce = fallData.effectiveMass * fallData.maxVelocity
+        if not fallData.effectiveMass then
+            return
+        end
+
+        -- Apply configuration multiplier
+        local configMultiplier = GetFloat("savegame.mod.pcomb.impact.multiplier") or 1.0
+        impactForce = impactForce * configMultiplier
+        
+        -- Calculate damage based on impact force and material properties
+        local baseDamage = math.min(impactForce / 1000, 10) -- Cap at 10 for balance
+        
+        -- Material-specific damage multipliers
+        local materialMultiplier = 1.0
+        if fallData.materialProps.name == "Stone" or fallData.materialProps.name == "Concrete" then
+            materialMultiplier = 1.5 -- Stone hits harder
+        elseif fallData.materialProps.name == "Metal" or fallData.materialProps.name == "Steel" then
+            materialMultiplier = 1.3 -- Metal hits hard
+        elseif fallData.materialProps.name == "Glass" then
+            materialMultiplier = 0.7 -- Glass breaks on impact, less damage to others
+        elseif fallData.materialProps.name == "Wood" then
+            materialMultiplier = 1.0 -- Wood is moderate
+        end
+        
+        local finalDamage = baseDamage * materialMultiplier
+        
+        -- Use configurable impact radius
+        local configRadius = GetFloat("savegame.mod.pcomb.impact.radius") or 2.0
+        local impactRadius = math.max(finalDamage * 0.5, configRadius) -- Damage radius based on impact force
+        
+        QueryRequire("physical")
+        local nearbyBodies = QueryAabbBodies(
+            impactPosition[1] - impactRadius, impactPosition[2] - impactRadius, impactPosition[3] - impactRadius,
+            impactPosition[1] + impactRadius, impactPosition[2] + impactRadius, impactPosition[3] + impactRadius
+        )
+        
+        for _, nearbyBody in ipairs(nearbyBodies) do
+            if nearbyBody ~= body and IsBodyActive(nearbyBody) then
+                -- Calculate damage based on distance from impact
+                local bodyPos = GetBodyTransform(nearbyBody).pos
+                local distance = VecLength(VecSub(bodyPos, impactPosition))
+                local distanceFactor = math.max(0, 1 - (distance / impactRadius))
+                
+                if distanceFactor > 0.1 then
+                    local damageToApply = finalDamage * distanceFactor
+                    
+                    -- Apply damage to shapes in the body
+                    local shapes = GetBodyShapes(nearbyBody)
+                    for _, shape in ipairs(shapes) do
+                        local shapeBounds = GetShapeBounds(shape)
+                        if shapeBounds then
+                            -- Calculate damage position within shape bounds
+                            local damagePos = {
+                                shapeBounds[1] + (shapeBounds[4] - shapeBounds[1]) * math.random(),
+                                shapeBounds[2] + (shapeBounds[5] - shapeBounds[2]) * math.random(),
+                                shapeBounds[3] + (shapeBounds[6] - shapeBounds[3]) * math.random()
+                            }
+                            
+                            -- Apply damage based on material
+                            local woodDamage = damageToApply * GetInt("savegame.mod.pcomb.ibsit.wood_damage") / 100
+                            local stoneDamage = damageToApply * GetInt("savegame.mod.pcomb.ibsit.stone_damage") / 100
+                            local metalDamage = damageToApply * GetInt("savegame.mod.pcomb.ibsit.metal_damage") / 100
+                            
+                            MakeHole(damagePos, woodDamage, stoneDamage, metalDamage)
+                        end
+                    end
+                    
+                    -- Create impact effects
+                    PcombEffects.createImpactEffects(impactPosition, finalDamage, fallData.materialProps.name)
+                    
+                    -- Play impact sound
+                    PcombEffects.playImpactSound(impactPosition, finalDamage, fallData.materialProps.name)
+                end
+            end
+        end
+    end,
+    
+    -- NEW: Create visual effects for impacts
+    createImpactEffects = function(position, intensity, materialName)
+        local effectCount = math.floor(intensity * 5) + 3
+        
+        for i = 1, effectCount do
+            local offset = {
+                (math.random() - 0.5) * 2,
+                math.random() * 0.5,
+                (math.random() - 0.5) * 2
+            }
+            local effectPos = VecAdd(position, offset)
+            
+            -- Material-specific impact particles
+            if materialName == "Stone" or materialName == "Concrete" then
+                -- Stone/concrete creates dust and debris
+                SpawnParticle(effectPos, {
+                    (math.random() - 0.5) * 3,
+                    math.random() * 2,
+                    (math.random() - 0.5) * 3
+                }, math.random() * 3)
+            elseif materialName == "Metal" or materialName == "Steel" then
+                -- Metal creates sparks
+                SpawnParticle(effectPos, {
+                    (math.random() - 0.5) * 2,
+                    math.random() * 1.5,
+                    (math.random() - 0.5) * 2
+                }, math.random() * 2)
+            elseif materialName == "Wood" then
+                -- Wood creates splinters
+                SpawnParticle(effectPos, {
+                    (math.random() - 0.5) * 2.5,
+                    math.random() * 1.8,
+                    (math.random() - 0.5) * 2.5
+                }, math.random() * 2.5)
+            else
+                -- Default impact dust
+                SpawnParticle(effectPos, {
+                    (math.random() - 0.5) * 2,
+                    math.random() * 1.2,
+                    (math.random() - 0.5) * 2
+                }, math.random() * 2)
+            end
+        end
+    end,
+    
+    -- NEW: Play impact sound based on material and intensity
+    playImpactSound = function(position, intensity, materialName)
+        local volume = GetFloat("savegame.mod.pcomb.ibsit.volume")
+        
+        if materialName == "Stone" or materialName == "Concrete" then
+            if intensity > 3 then
+                PlaySound(LoadSound("sound/impact_stone_heavy.ogg"), position, volume * 1.2)
+            else
+                PlaySound(LoadSound("sound/impact_stone_light.ogg"), position, volume)
+            end
+        elseif materialName == "Metal" or materialName == "Steel" then
+            if intensity > 3 then
+                PlaySound(LoadSound("sound/impact_metal_heavy.ogg"), position, volume * 1.3)
+            else
+                PlaySound(LoadSound("sound/impact_metal_light.ogg"), position, volume * 1.1)
+            end
+        elseif materialName == "Wood" then
+            if intensity > 3 then
+                PlaySound(LoadSound("sound/impact_wood_heavy.ogg"), position, volume * 1.1)
+            else
+                PlaySound(LoadSound("sound/impact_wood_light.ogg"), position, volume)
+            end
+        elseif materialName == "Glass" then
+            PlaySound(LoadSound("sound/impact_glass.ogg"), position, volume * 0.9)
+        else
+            -- Default impact sound
+            if intensity > 3 then
+                PlaySound(LoadSound("sound/impact_heavy.ogg"), position, volume)
+            else
+                PlaySound(LoadSound("sound/impact_light.ogg"), position, volume * 0.8)
+            end
         end
     end
 }
