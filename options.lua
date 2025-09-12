@@ -85,6 +85,24 @@ function init()
         SetInt("savegame.mod.pcomb.mbcs.mass_threshold", 8)
         SetInt("savegame.mod.pcomb.mbcs.distance_threshold", 4)
     end
+
+    -- Materials defaults
+    if not HasKey("savegame.mod.pcomb.materials.multi_directional") then
+        SetBool("savegame.mod.pcomb.materials.multi_directional", true)
+        SetFloat("savegame.mod.pcomb.materials.glass.density", 2.5)
+        SetFloat("savegame.mod.pcomb.materials.glass.collapse_resistance", 0.1)
+        SetFloat("savegame.mod.pcomb.materials.wood.density", 0.6)
+        SetFloat("savegame.mod.pcomb.materials.wood.collapse_resistance", 0.4)
+        SetFloat("savegame.mod.pcomb.materials.stone.density", 2.6)
+        SetFloat("savegame.mod.pcomb.materials.stone.collapse_resistance", 0.8)
+        SetFloat("savegame.mod.pcomb.materials.metal.density", 7.8)
+        SetFloat("savegame.mod.pcomb.materials.metal.collapse_resistance", 0.95)
+        SetFloat("savegame.mod.pcomb.materials.compatibility_factor", 1.0)
+    end
+
+    if not HasKey("savegame.mod.pcomb.conversion.size_threshold") then
+        SetFloat("savegame.mod.pcomb.conversion.size_threshold", 1.0)
+    end
 end
 
 function draw()
@@ -197,6 +215,16 @@ function drawGlobalTab()
     local newPriority = UiSliderWithValue("ui/common/dot.png", 360, 20, priority, 1, 3, "%.0f")
     if newPriority ~= priority then
         SetInt("savegame.mod.pcomb.global.priority", newPriority)
+    end
+    UiTranslate(0, 30)
+
+    -- Conversion size threshold
+    UiText("Conversion Size Threshold")
+    UiTranslate(0, 25)
+    local sizeThreshold = GetFloat("savegame.mod.pcomb.conversion.size_threshold")
+    local newSizeThreshold = UiSliderWithValue("ui/common/dot.png", 360, 20, sizeThreshold * 10, 1, 50, "%.1f") / 10
+    if newSizeThreshold ~= sizeThreshold then
+        SetFloat("savegame.mod.pcomb.conversion.size_threshold", newSizeThreshold)
     end
     UiTranslate(0, 30)
 
@@ -734,16 +762,40 @@ function drawMaterialsTab()
 
     UiText("Multi-Directional Analysis")
     UiTranslate(0, 25)
-    local multiDir = GetBool("savegame.mod.pcomb.materials.multi_directional") or true
+    
+    -- Read current state from registry
+    local multiDir = GetBool("savegame.mod.pcomb.materials.multi_directional")
+    local buttonClicked = false
+    local newMultiDir = multiDir
+    
     if multiDir then
         UiColor(0.2, 0.8, 0.2)
         if UiTextButton("Enabled") then
-            SetBool("savegame.mod.pcomb.materials.multi_directional", false)
+            buttonClicked = true
+            newMultiDir = false
+            SetBool("savegame.mod.pcomb.materials.multi_directional", newMultiDir)
         end
     else
         UiColor(0.8, 0.2, 0.2)
         if UiTextButton("Disabled") then
-            SetBool("savegame.mod.pcomb.materials.multi_directional", true)
+            buttonClicked = true
+            newMultiDir = true
+            SetBool("savegame.mod.pcomb.materials.multi_directional", newMultiDir)
+        end
+    end
+    
+    -- If button was clicked, provide immediate visual feedback by redrawing with new state
+    if buttonClicked then
+        UiTranslate(0, -25)  -- Move back up to redraw the button
+        UiText("Multi-Directional Analysis")
+        UiTranslate(0, 25)
+        
+        if newMultiDir then
+            UiColor(0.2, 0.8, 0.2)
+            UiText("Enabled")
+        else
+            UiColor(0.8, 0.2, 0.2)
+            UiText("Disabled")
         end
     end
     UiTranslate(0, 40)

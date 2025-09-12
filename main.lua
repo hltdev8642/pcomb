@@ -174,7 +174,7 @@ local function initializeConfiguration()
         
         -- New features
         SetBool("savegame.mod.pcomb.ibsit.gravity_collapse", true)
-        SetFloat("savegame.mod.pcomb.ibsit.collapse_threshold", 0.3)
+        SetFloat("savegame.mod.pcomb.ibsit.collapse_threshold", 0.15)
         SetFloat("savegame.mod.pcomb.ibsit.gravity_force", 2.0)
         SetBool("savegame.mod.pcomb.ibsit.debris_cleanup", true)
         SetFloat("savegame.mod.pcomb.ibsit.cleanup_delay", 30.0)
@@ -182,6 +182,9 @@ local function initializeConfiguration()
         SetInt("savegame.mod.pcomb.ibsit.target_fps", 30)
         SetFloat("savegame.mod.pcomb.ibsit.volume", 0.7)
         SetInt("savegame.mod.pcomb.ibsit.particle_quality", 2)
+        
+        -- Multi-directional analysis (enabled by default for better collapse detection)
+        SetBool("savegame.mod.pcomb.materials.multi_directional", true)
     end
 
     -- MBCS System Settings (Mass Based Collateral)
@@ -395,20 +398,60 @@ PcombDetection = {
         local collapseCandidates = {}
         
         -- Query for bodies that might need gravity collapse analysis
-        local min = {breakpoint[1] - breaksize * 2, breakpoint[2] - breaksize * 2, breakpoint[3] - breaksize * 2}
-        local max = {breakpoint[1] + breaksize * 2, breakpoint[2] + breaksize * 2, breakpoint[3] + breaksize * 2}
+        -- Use a larger search area and more inclusive query requirements
+        local searchMultiplier = 3.0  -- Increased from 2.0 for better coverage
+        local min = {breakpoint[1] - breaksize * searchMultiplier, 
+                     breakpoint[2] - breaksize * searchMultiplier, 
+                     breakpoint[3] - breaksize * searchMultiplier}
+        local max = {breakpoint[1] + breaksize * searchMultiplier, 
+                     breakpoint[2] + breaksize * searchMultiplier, 
+                     breakpoint[3] + breaksize * searchMultiplier}
         
-        QueryRequire("physical dynamic large")
+        -- Use more inclusive query to find all physical bodies
+        QueryRequire("physical")
         local bodies = QueryAabbBodies(min, max)
+        
+        if GetBool("savegame.mod.pcomb.global.debug") then
+            DebugPrint("Gravity collapse analysis: Found " .. #bodies .. " bodies in search area")
+        end
         
         for i = 1, #bodies do
             local body = bodies[i]
-            if IsBodyActive(body) and not IsBodyBroken(body) then
-                local collapseData = PcombDetection.analyzeBodySupport(body, breakpoint)
-                if collapseData.needsCollapse then
-                    collapseCandidates[body] = collapseData
+            -- Include both active and inactive bodies that could potentially collapse
+            -- Only exclude bodies that are already broken
+            if not IsBodyBroken(body) then
+                -- NEW: Proactively convert static bodies to dynamic before analysis
+                -- This ensures all bodies can participate in physics simulation from the start
+                if PcombDetection.isBodyStatic(body) then
+                    local converted = PcombDetection.convertStaticToDynamic(body)
+                    if not converted and GetBool("savegame.mod.pcomb.global.debug") then
+                        DebugPrint("Failed to convert static body to dynamic: " .. tostring(body))
+                    end
+                end
+                
+                local bodyPos = GetBodyTransform(body).pos
+                if bodyPos then
+                    -- Check if body is within reasonable distance of breakpoint
+                    local distance = VecLength(VecSub(bodyPos, breakpoint))
+                    if distance <= breaksize * searchMultiplier then
+                        local collapseData = PcombDetection.analyzeBodySupport(body, breakpoint)
+                        if collapseData.needsCollapse then
+                            collapseCandidates[body] = collapseData
+                            
+                            if GetBool("savegame.mod.pcomb.global.debug") then
+                                DebugPrint("Body " .. tostring(body) .. " marked for collapse (distance: " .. 
+                                          string.format("%.2f", distance) .. ")")
+                            end
+                        end
+                    end
                 end
             end
+        end
+        
+        if GetBool("savegame.mod.pcomb.global.debug") then
+            local collapseCount = 0
+            for _ in pairs(collapseCandidates) do collapseCount = collapseCount + 1 end
+            DebugPrint("Gravity collapse analysis complete: " .. collapseCount .. " bodies need collapse")
         end
         
         return collapseCandidates
@@ -444,8 +487,41 @@ PcombDetection = {
         local materialName = PcombDetection.getBodyMaterial(body)
         local effectiveMass, materialProps = PcombMaterials.calculateEffectiveMass(body, materialName)
         
-        -- Multi-directional support analysis
-        local supportAnalysis = PcombDetection.analyzeMultiDirectionalSupport(body, bounds, materialName)
+        -- Multi-directional support analysis (conditional based on toggle)
+        local supportAnalysis
+        if GetBool("savegame.mod.pcomb.materials.multi_directional") then
+            supportAnalysis = PcombDetection.analyzeMultiDirectionalSupport(body, bounds, materialName)
+        else
+            -- Fallback to basic support analysis when multi-directional is disabled
+            local supportingBodies = PcombDetection.findSupportingBodies(body, bounds)
+            local totalSupportMass = 0
+            local totalSupportArea = 0
+            
+            for _, supportBody in ipairs(supportingBodies) do
+                if IsBodyActive(supportBody) then
+                    totalSupportMass = totalSupportMass + GetBodyMass(supportBody)
+                    -- Estimate support area based on body bounds
+                    local supportBounds = GetBodyBounds(supportBody)
+                    if supportBounds then
+                        local supportArea = (supportBounds[4] - supportBounds[1]) * (supportBounds[6] - supportBounds[3])
+                        totalSupportArea = totalSupportArea + supportArea
+                    end
+                end
+            end
+            
+            -- Create simplified support analysis structure
+            supportAnalysis = {
+                supportingBodies = supportingBodies,
+                totalSupportMass = totalSupportMass,
+                totalSupportArea = totalSupportArea,
+                bodyBaseArea = (bounds[4] - bounds[1]) * (bounds[6] - bounds[3]),
+                directionalSupport = {
+                    below = {bodies = supportingBodies, mass = totalSupportMass, area = totalSupportArea},
+                    above = {bodies = {}, mass = 0, area = 0},
+                    sides = {bodies = {}, mass = 0, area = 0}
+                }
+            }
+        end
         
         -- Calculate overall stability metrics
         local stabilityRatio = supportAnalysis.totalSupportMass / effectiveMass
@@ -501,10 +577,10 @@ PcombDetection = {
         local collapseStrength = 0
         
         -- Multiple collapse criteria with improved weight consideration
-        if stabilityRatio < materialAdjustedThreshold * 0.6 or 
+        if stabilityRatio < materialAdjustedThreshold * 0.8 or 
            supportAreaRatio < minSupportAreaRatio or  -- Use minimum support area threshold
-           collapseProbability > 0.3 or
-           stressFactor > materialProps.strength * 0.8 or
+           collapseProbability > 0.2 or
+           stressFactor > materialProps.strength * 0.6 or
            hasMinimalSupport or  -- Check for minimal connections
            torqueBasedCollapse then  -- NEW: Include torque-based collapse
            
@@ -517,6 +593,20 @@ PcombDetection = {
                 torqueCollapseStrength  -- NEW: Include torque-based strength
             )
             collapseStrength = math.min(collapseStrength, 1.0)
+        end
+        
+        -- Add debug output for collapse detection
+        if GetBool("savegame.mod.pcomb.global.debug") then
+            DebugPrint("Body collapse analysis for " .. tostring(body) .. ":")
+            DebugPrint("  Material: " .. materialName .. " (resistance: " .. string.format("%.2f", materialProps.collapseResistance) .. ")")
+            DebugPrint("  Stability ratio: " .. string.format("%.3f", stabilityRatio) .. " (threshold: " .. string.format("%.3f", materialAdjustedThreshold * 0.8) .. ")")
+            DebugPrint("  Support area ratio: " .. string.format("%.3f", supportAreaRatio) .. " (min required: " .. string.format("%.3f", minSupportAreaRatio) .. ")")
+            DebugPrint("  Collapse probability: " .. string.format("%.3f", collapseProbability) .. " (threshold: 0.2)")
+            DebugPrint("  Stress factor: " .. string.format("%.3f", stressFactor) .. " (threshold: " .. string.format("%.3f", materialProps.strength * 0.6) .. ")")
+            DebugPrint("  Has minimal support: " .. tostring(hasMinimalSupport))
+            DebugPrint("  Torque-based collapse: " .. tostring(torqueBasedCollapse) .. " (strength: " .. string.format("%.3f", torqueCollapseStrength) .. ")")
+            DebugPrint("  NEEDS COLLAPSE: " .. tostring(needsCollapse) .. " (strength: " .. string.format("%.3f", collapseStrength) .. ")")
+            DebugPrint("---")
         end
         
         return {
@@ -552,10 +642,30 @@ PcombDetection = {
         
         for _, nearbyBody in ipairs(nearbyBodies) do
             if nearbyBody ~= body and IsBodyActive(nearbyBody) then
+                -- NEW: Proactively convert static supporting bodies to dynamic
+                -- This ensures supporting bodies can participate in physics simulation
+                if PcombDetection.isBodyStatic(nearbyBody) then
+                    local converted = PcombDetection.convertStaticToDynamic(nearbyBody)
+                    if not converted and GetBool("savegame.mod.pcomb.global.debug") then
+                        DebugPrint("Failed to convert static supporting body to dynamic: " .. tostring(nearbyBody))
+                    end
+                end
+                
                 local nearbyBounds = GetBodyBounds(nearbyBody)
-                if nearbyBounds and nearbyBounds[5] >= bounds[2] - 0.1 then
-                    -- Body is at or above our base level
-                    table.insert(supportingBodies, nearbyBody)
+                if nearbyBounds and type(nearbyBounds) == "table" and #nearbyBounds >= 6 then
+                    -- Validate bounds array before arithmetic operations
+                    local boundsValid = true
+                    for i = 1, 6 do
+                        if not nearbyBounds[i] or type(nearbyBounds[i]) ~= "number" then
+                            boundsValid = false
+                            break
+                        end
+                    end
+                    
+                    if boundsValid and nearbyBounds[5] >= bounds[2] - 0.1 then
+                        -- Body is at or above our base level
+                        table.insert(supportingBodies, nearbyBody)
+                    end
                 end
             end
         end
@@ -564,6 +674,19 @@ PcombDetection = {
     end,
     
     calculateOverlapArea = function(bounds1, bounds2)
+        -- Validate bounds before arithmetic operations
+        if not bounds1 or type(bounds1) ~= "table" or #bounds1 < 6 or
+           not bounds2 or type(bounds2) ~= "table" or #bounds2 < 6 then
+            return 0
+        end
+        
+        for i = 1, 6 do
+            if not bounds1[i] or type(bounds1[i]) ~= "number" or
+               not bounds2[i] or type(bounds2[i]) ~= "number" then
+                return 0
+            end
+        end
+        
         -- Calculate overlapping area between two bounding boxes
         local xOverlap = math.max(0, math.min(bounds1[4], bounds2[4]) - math.max(bounds1[1], bounds2[1]))
         local zOverlap = math.max(0, math.min(bounds1[6], bounds2[6]) - math.max(bounds1[3], bounds2[3]))
@@ -663,6 +786,15 @@ PcombDetection = {
         
         for _, nearbyBody in ipairs(nearbyBodies) do
             if nearbyBody ~= body and IsBodyActive(nearbyBody) then
+                -- NEW: Proactively convert static bodies to dynamic before multi-directional analysis
+                -- This ensures all bodies can participate in physics simulation
+                if PcombDetection.isBodyStatic(nearbyBody) then
+                    local converted = PcombDetection.convertStaticToDynamic(nearbyBody)
+                    if not converted and GetBool("savegame.mod.pcomb.global.debug") then
+                        DebugPrint("Failed to convert static body in multi-directional analysis to dynamic: " .. tostring(nearbyBody))
+                    end
+                end
+                
                 local nearbyBounds = GetBodyBounds(nearbyBody)
                 if nearbyBounds then
                     local direction = PcombDetection.classifyBodyDirection(bounds, nearbyBounds)
@@ -828,6 +960,17 @@ PcombDetection = {
     checkMinimalSupport = function(supportAnalysis, bounds, materialProps)
         if #supportAnalysis.supportingBodies == 0 then return true end
         
+        -- Validate bounds array before arithmetic operations
+        if not bounds or type(bounds) ~= "table" or #bounds < 6 then
+            return true -- Assume minimal support if bounds are invalid
+        end
+        
+        for i = 1, 6 do
+            if not bounds[i] or type(bounds[i]) ~= "number" then
+                return true -- Assume minimal support if bounds contain invalid values
+            end
+        end
+        
         -- Calculate total support dimensions
         local totalSupportWidth = 0
         local totalSupportDepth = 0
@@ -835,13 +978,24 @@ PcombDetection = {
         for _, supportBody in ipairs(supportAnalysis.supportingBodies) do
             if IsBodyActive(supportBody) then
                 local supportBounds = GetBodyBounds(supportBody)
-                if supportBounds then
-                    -- Calculate overlap dimensions
-                    local overlapWidth = math.max(0, math.min(bounds[4], supportBounds[4]) - math.max(bounds[1], supportBounds[1]))
-                    local overlapDepth = math.max(0, math.min(bounds[6], supportBounds[6]) - math.max(bounds[3], supportBounds[3]))
+                if supportBounds and type(supportBounds) == "table" and #supportBounds >= 6 then
+                    -- Validate supportBounds before arithmetic operations
+                    local supportValid = true
+                    for i = 1, 6 do
+                        if not supportBounds[i] or type(supportBounds[i]) ~= "number" then
+                            supportValid = false
+                            break
+                        end
+                    end
                     
-                    totalSupportWidth = totalSupportWidth + overlapWidth
-                    totalSupportDepth = totalSupportDepth + overlapDepth
+                    if supportValid then
+                        -- Calculate overlap dimensions
+                        local overlapWidth = math.max(0, math.min(bounds[4], supportBounds[4]) - math.max(bounds[1], supportBounds[1]))
+                        local overlapDepth = math.max(0, math.min(bounds[6], supportBounds[6]) - math.max(bounds[3], supportBounds[3]))
+                        
+                        totalSupportWidth = totalSupportWidth + overlapWidth
+                        totalSupportDepth = totalSupportDepth + overlapDepth
+                    end
                 end
             end
         end
@@ -888,73 +1042,703 @@ PcombDetection = {
     convertStaticToDynamic = function(body)
         if not PcombDetection.isBodyStatic(body) then return false end
         
+        -- NEW: Check body size threshold to avoid converting small debris
+        local voxelCount = PcombDetection.getBodyVoxelCount(body)
+        local sizeThreshold = GetInt("savegame.mod.pcomb.conversion.size_threshold") or 100  -- Configurable threshold, default 100 voxels
+        
+        if voxelCount < sizeThreshold then
+            if GetBool("savegame.mod.pcomb.global.debug") then
+                DebugPrint("Skipped conversion of small body: " .. tostring(body) .. " (voxels: " .. voxelCount .. ")")
+            end
+            return false
+        end
+        
         -- Enable physics simulation for this body
         SetBodyActive(body, true)
-        
-        -- Ensure the body has proper mass for physics calculations
-        local currentMass = GetBodyMass(body)
-        if currentMass and currentMass < 1.0 then
-            -- Set minimum mass for dynamic behavior
-            SetBodyMass(body, 1.0)
-        end
+        SetBodyDynamic(body, true)
+        -- Note: In Teardown, body mass is automatically calculated from shape properties
+        -- and cannot be manually set. The engine handles this automatically.
         
         -- Reset any kinematic constraints that might prevent physics
         -- This ensures the body can now fall and interact with other bodies
         
         if GetBool("savegame.mod.pcomb.global.debug") then
-            DebugPrint("Converted static body to dynamic: " .. tostring(body))
+            DebugPrint("Converted static body to dynamic: " .. tostring(body) .. " (voxels: " .. voxelCount .. ")")
         end
         
         return true
     end,
     
-    -- NEW: Calculate torque (rotational force) using T = F × d formula
-    -- Torque = Force × Distance from center of mass to force application point
-    calculateTorque = function(force, centerOfMass, forcePoint)
-        -- Calculate vector from center of mass to force application point
-        local r = {
-            forcePoint[1] - centerOfMass[1],
-            forcePoint[2] - centerOfMass[2], 
-            forcePoint[3] - centerOfMass[3]
-        }
-        
-        -- Calculate torque using cross product: T = r × F
-        -- For 2D stability analysis, we focus on the torque that causes rotation around the support axis
-        local torqueX = r[2] * force[3] - r[3] * force[2]  -- Rotation around X-axis
-        local torqueY = r[3] * force[1] - r[1] * force[3]  -- Rotation around Y-axis  
-        local torqueZ = r[1] * force[2] - r[2] * force[1]  -- Rotation around Z-axis
-        
-        -- Return the magnitude of torque that would cause tipping
-        -- For stability analysis, we typically care about the torque around the axis perpendicular to gravity
-        return math.sqrt(torqueX*torqueX + torqueZ*torqueZ)  -- Horizontal torque magnitude
+    -- Enhanced multi-body structure analysis with spatial partitioning
+    analyzeMultiBodyStructure = function(seedBody, impactPoint)
+        -- Initialize spatial partition if needed
+        if not PcombDetection.spatialPartition.octree then
+            PcombDetection.initSpatialPartition()
+        end
+
+        -- Use GetJointedBodies to find all connected bodies in the structure
+        local jointedBodies = GetJointedBodies(seedBody)
+        if not jointedBodies or #jointedBodies == 0 then
+            -- Fallback to single body analysis
+            return PcombDetection.analyzeBodySupport(seedBody, impactPoint)
+        end
+
+        -- Add the seed body to the structure
+        local structureBodies = {seedBody}
+        for _, body in ipairs(jointedBodies) do
+            table.insert(structureBodies, body)
+        end
+
+        -- NEW: Use spatial partitioning to limit analysis to nearby bodies
+        local nearbyBodies = PcombDetection.queryBodiesInRadius(impactPoint, 50, PcombDetection.spatialPartition.octree)
+        local relevantBodies = {}
+
+        -- Filter structure bodies to only include those in the nearby area
+        for _, body in ipairs(structureBodies) do
+            local bodyPos = GetBodyTransform(body).pos
+            if bodyPos and VecLength(VecSub(bodyPos, impactPoint)) <= 50 then
+                table.insert(relevantBodies, body)
+            end
+        end
+
+        -- Use relevant bodies for analysis
+        structureBodies = relevantBodies
+
+        -- Analyze the entire multi-body structure with batch processing
+        local structureAnalysis = PcombDetection.batchAnalyzeStructure(structureBodies, impactPoint)
+
+        return structureAnalysis
     end,
     
-    -- NEW: Calculate center of mass for a body
-    calculateCenterOfMass = function(body)
-        -- Try to get center of mass from Teardown API first
-        local com = GetBodyCenterOfMass(body)
-        if com then
-            return com
+    -- NEW: Calculate structural integrity based on base support percentage
+    calculateStructuralIntegrity = function(structureAnalysis)
+        if #structureAnalysis.bodies == 0 then return 0 end
+        
+        local totalBaseSupport = 0
+        local totalBaseArea = 0
+        
+        -- Calculate base support for the entire structure
+        for _, body in ipairs(structureAnalysis.bodies) do
+            local bodyAnalysis = structureAnalysis.supportAnalysis[body]
+            if bodyAnalysis then
+                totalBaseSupport = totalBaseSupport + bodyAnalysis.supportAreaRatio
+                totalBaseArea = totalBaseArea + 1 -- Normalize by body count
+            end
         end
         
-        -- Fallback: calculate approximate center of mass from body bounds
-        local bounds = GetBodyBounds(body)
-        if not bounds or type(bounds) ~= "table" or #bounds < 6 then
-            return {0, 0, 0}  -- Default fallback
+        -- Structural integrity is the average support ratio across all bodies
+        local integrity = totalBaseArea > 0 and (totalBaseSupport / totalBaseArea) or 0
+        
+        -- Apply material-specific modifiers
+        local materialModifier = 1.0
+        for _, body in ipairs(structureAnalysis.bodies) do
+            local bodyAnalysis = structureAnalysis.supportAnalysis[body]
+            if bodyAnalysis and bodyAnalysis.materialProps then
+                -- Brittle materials reduce overall integrity
+                materialModifier = materialModifier * bodyAnalysis.materialProps.collapseResistance
+            end
         end
         
-        -- Calculate geometric center as approximation
-        local centerX = (bounds[1] + bounds[4]) / 2
-        local centerY = (bounds[2] + bounds[5]) / 2
-        local centerZ = (bounds[3] + bounds[6]) / 2
+        return math.max(0, math.min(1, integrity * materialModifier))
+    end,
+    
+    -- NEW: Analyze force distribution across multi-body structure
+    analyzeForceDistribution = function(structureAnalysis, impactPoint)
+        local forceDistribution = {
+            verticalForces = {},
+            horizontalForces = {},
+            torqueDistribution = {},
+            stressPoints = {},
+            weakPoints = {}
+        }
         
-        return {centerX, centerY, centerZ}
+        -- Calculate gravitational forces for each body
+        for _, body in ipairs(structureAnalysis.bodies) do
+            local bodyAnalysis = structureAnalysis.supportAnalysis[body]
+            if bodyAnalysis then
+                local bodyMass = bodyAnalysis.effectiveMass or bodyAnalysis.bodyMass
+                local gravityForce = {0, -bodyMass * 9.81, 0}
+                
+                -- Calculate force distribution from center of mass
+                local bodyCOM = bodyAnalysis.centerOfMass
+                local distanceFromImpact = VecLength(VecSub(bodyCOM, impactPoint))
+                
+                -- Force magnitude decreases with distance from impact
+                local distanceFactor = math.max(0.1, 1 - (distanceFromImpact / 20))
+                local adjustedForce = {
+                    gravityForce[1] * distanceFactor,
+                    gravityForce[2] * distanceFactor,
+                    gravityForce[3] * distanceFactor
+                }
+                
+                forceDistribution.verticalForces[body] = adjustedForce
+                
+                -- Calculate horizontal forces based on structural connections
+                local horizontalForce = PcombDetection.calculateHorizontalForces(body, structureAnalysis)
+                forceDistribution.horizontalForces[body] = horizontalForce
+                
+                -- Calculate torque distribution
+                local torqueDist = PcombDetection.calculateTorqueDistribution(body, structureAnalysis, impactPoint)
+                forceDistribution.torqueDistribution[body] = torqueDist
+                
+                -- Identify stress points and weak points
+                if bodyAnalysis.stressFactor and bodyAnalysis.stressFactor > 100 then
+                    table.insert(forceDistribution.stressPoints, {
+                        body = body,
+                        stress = bodyAnalysis.stressFactor,
+                        position = bodyCOM
+                    })
+                end
+                
+                if bodyAnalysis.collapseProbability and bodyAnalysis.collapseProbability > 0.5 then
+                    table.insert(forceDistribution.weakPoints, {
+                        body = body,
+                        weakness = bodyAnalysis.collapseProbability,
+                        position = bodyCOM
+                    })
+                end
+            end
+        end
+        
+        return forceDistribution
+    end,
+    
+    -- NEW: Calculate horizontal forces based on structural connections
+    calculateHorizontalForces = function(body, structureAnalysis)
+        local horizontalForce = {0, 0, 0}
+        
+        -- Find connected bodies and calculate lateral forces
+        for _, otherBody in ipairs(structureAnalysis.bodies) do
+            if otherBody ~= body then
+                local connectionForce = PcombDetection.calculateConnectionForce(body, otherBody)
+                horizontalForce[1] = horizontalForce[1] + connectionForce[1]
+                horizontalForce[2] = horizontalForce[2] + connectionForce[2]
+                horizontalForce[3] = horizontalForce[3] + connectionForce[3]
+            end
+        end
+        
+        return horizontalForce
+    end,
+    
+    -- NEW: Calculate forces between connected bodies
+    calculateConnectionForce = function(body1, body2)
+        local body1Transform = GetBodyTransform(body1)
+        local body2Transform = GetBodyTransform(body2)
+        
+        if not body1Transform or not body2Transform then
+            return {0, 0, 0}
+        end
+        
+        local body1Pos = body1Transform.pos
+        local body2Pos = body2Transform.pos
+        
+        -- Calculate distance and direction between bodies
+        local direction = {
+            body2Pos[1] - body1Pos[1],
+            body2Pos[2] - body1Pos[2],
+            body2Pos[3] - body1Pos[3]
+        }
+        
+        local distance = VecLength(direction)
+        if distance < 0.1 then return {0, 0, 0} end
+        
+        -- Normalize direction
+        local normalizedDir = {
+            direction[1] / distance,
+            direction[2] / distance,
+            direction[3] / distance
+        }
+        
+        -- Calculate connection force based on body masses and distance
+        local body1Mass = GetBodyMass(body1) or 0
+        local body2Mass = GetBodyMass(body2) or 0
+        local combinedMass = body1Mass + body2Mass
+        
+        if combinedMass == 0 then return {0, 0, 0} end
+        
+        -- Force magnitude based on gravitational attraction between bodies
+        local forceMagnitude = (body1Mass * body2Mass) / (distance * distance) * 0.001
+        
+        return {
+            normalizedDir[1] * forceMagnitude,
+            normalizedDir[2] * forceMagnitude,
+            normalizedDir[3] * forceMagnitude
+        }
+    end,
+    
+    -- NEW: Calculate torque distribution for multi-body analysis
+    calculateTorque = function(force, centerOfMass, point)
+        -- Calculate torque as cross product of lever arm and force
+        -- Torque = r × F, where r is vector from center of mass to point
+        local leverArm = {
+            point[1] - centerOfMass[1],
+            point[2] - centerOfMass[2],
+            point[3] - centerOfMass[3]
+        }
+        
+        -- Cross product: (leverArm × force)
+        -- For 3D vectors A = (Ax, Ay, Az) and B = (Bx, By, Bz)
+        -- A × B = (Ay*Bz - Az*By, Az*Bx - Ax*Bz, Ax*By - Ay*Bx)
+        local torqueX = leverArm[2] * force[3] - leverArm[3] * force[2]
+        local torqueY = leverArm[3] * force[1] - leverArm[1] * force[3]
+        local torqueZ = leverArm[1] * force[2] - leverArm[2] * force[1]
+        
+        -- Return magnitude of torque vector
+        return math.sqrt(torqueX*torqueX + torqueY*torqueY + torqueZ*torqueZ)
+    end,
+    
+    calculateTorqueDistribution = function(body, structureAnalysis, impactPoint)
+        local bodyAnalysis = structureAnalysis.supportAnalysis[body]
+        if not bodyAnalysis then return {magnitude = 0, direction = {0, 0, 0}} end
+        
+        local bodyCOM = bodyAnalysis.centerOfMass
+        local bodyMass = bodyAnalysis.effectiveMass or bodyAnalysis.bodyMass
+        
+        -- Calculate torque from gravitational force
+        local gravityForce = {0, -bodyMass * 9.81, 0}
+        local torqueMagnitude = PcombDetection.calculateTorque(gravityForce, bodyCOM, impactPoint)
+        
+        -- Calculate torque direction (simplified for 2D analysis)
+        local torqueDirection = {0, 0, 0}
+        if torqueMagnitude > 0 then
+            local toImpact = {
+                impactPoint[1] - bodyCOM[1],
+                0, -- Ignore Y for horizontal torque
+                impactPoint[3] - bodyCOM[3]
+            }
+            local magnitude = VecLength(toImpact)
+            if magnitude > 0 then
+                torqueDirection = {
+                    toImpact[1] / magnitude,
+                    0,
+                    toImpact[3] / magnitude
+                }
+            end
+        end
+        
+        return {
+            magnitude = torqueMagnitude,
+            direction = torqueDirection,
+            centerOfMass = bodyCOM
+        }
+    end,
+    
+    -- NEW: Implement chain reaction collapse mechanics
+    processChainReaction = function(structureAnalysis, impactPoint)
+        if not structureAnalysis.needsCollapse then return end
+        
+        local processedBodies = {}
+        local collapseQueue = {}
+        
+        -- Start with bodies that already need collapse
+        for _, body in ipairs(structureAnalysis.chainReactionBodies) do
+            table.insert(collapseQueue, body)
+        end
+        
+        -- Process chain reactions
+        while #collapseQueue > 0 do
+            local currentBody = table.remove(collapseQueue, 1)
+            
+            if not processedBodies[currentBody] then
+                processedBodies[currentBody] = true
+                
+                -- Apply collapse to current body
+                local bodyAnalysis = structureAnalysis.supportAnalysis[currentBody]
+                if bodyAnalysis then
+                    PcombEffects.applyGravityCollapse(currentBody, bodyAnalysis)
+                end
+                
+                -- Find bodies that might be affected by this collapse
+                local affectedBodies = PcombDetection.findAffectedBodies(currentBody, structureAnalysis)
+                
+                for _, affectedBody in ipairs(affectedBodies) do
+                    if not processedBodies[affectedBody] then
+                        -- NEW: Proactively convert affected bodies to dynamic before analysis
+                        -- This ensures chain reaction bodies can participate in physics simulation
+                        if PcombDetection.isBodyStatic(affectedBody) then
+                            local converted = PcombDetection.convertStaticToDynamic(affectedBody)
+                            if not converted and GetBool("savegame.mod.pcomb.global.debug") then
+                                DebugPrint("Failed to convert static affected body to dynamic: " .. tostring(affectedBody))
+                            end
+                        end
+                        
+                        -- Check if this body now needs to collapse due to the chain reaction
+                        local updatedAnalysis = PcombDetection.analyzeBodySupport(affectedBody, impactPoint)
+                        
+                        if updatedAnalysis.needsCollapse then
+                            table.insert(collapseQueue, affectedBody)
+                            structureAnalysis.supportAnalysis[affectedBody] = updatedAnalysis
+                        end
+                    end
+                end
+            end
+        end
+        
+        if GetBool("savegame.mod.pcomb.global.debug") then
+            DebugPrint("Chain reaction processed " .. #processedBodies .. " bodies")
+        end
+    end,
+    
+    -- NEW: Find bodies affected by a collapsing body
+    findAffectedBodies = function(collapsingBody, structureAnalysis)
+        local affectedBodies = {}
+        local collapsingBounds = GetBodyBounds(collapsingBody)
+        
+        if not collapsingBounds then return affectedBodies end
+        
+        -- Find bodies above or adjacent to the collapsing body
+        for _, body in ipairs(structureAnalysis.bodies) do
+            if body ~= collapsingBody then
+                -- NEW: Proactively convert potentially affected bodies to dynamic
+                -- This ensures affected bodies can participate in physics simulation
+                if PcombDetection.isBodyStatic(body) then
+                    local converted = PcombDetection.convertStaticToDynamic(body)
+                    if not converted and GetBool("savegame.mod.pcomb.global.debug") then
+                        DebugPrint("Failed to convert static affected body to dynamic: " .. tostring(body))
+                    end
+                end
+                
+                local bodyBounds = GetBodyBounds(body)
+                if bodyBounds then
+                    -- Validate bounds array before arithmetic operations
+                    if type(bodyBounds) == "table" and #bodyBounds >= 6 then
+                        local allValid = true
+                        for i = 1, 6 do
+                            if not bodyBounds[i] or type(bodyBounds[i]) ~= "number" then
+                                allValid = false
+                                break
+                            end
+                        end
+                        
+                        if allValid then
+                            -- Check if body is above or adjacent to collapsing body
+                            local verticalOverlap = math.min(collapsingBounds[5], bodyBounds[5]) - 
+                                                  math.max(collapsingBounds[2], bodyBounds[2])
+                            local horizontalDistance = PcombDetection.calculateHorizontalDistance(collapsingBounds, bodyBounds)
+                            
+                            -- Body is affected if it's above (positive vertical overlap) or very close horizontally
+                            if verticalOverlap > 0 or horizontalDistance < 2.0 then
+                                table.insert(affectedBodies, body)
+                            end
+                        end
+                    end
+                end
+            end
+        end
+        
+        return affectedBodies
+    end,
+    
+    -- NEW: Calculate horizontal distance between two bounding boxes
+    calculateHorizontalDistance = function(bounds1, bounds2)
+        -- Validate bounds before arithmetic operations
+        if not bounds1 or type(bounds1) ~= "table" or #bounds1 < 6 or
+           not bounds2 or type(bounds2) ~= "table" or #bounds2 < 6 then
+            return 0
+        end
+        
+        for i = 1, 6 do
+            if not bounds1[i] or type(bounds1[i]) ~= "number" or
+               not bounds2[i] or type(bounds2[i]) ~= "number" then
+                return 0
+            end
+        end
+        
+        -- Calculate minimum horizontal distance between two AABBs
+        local dx = math.max(0, math.max(bounds1[1], bounds2[1]) - math.min(bounds1[4], bounds2[4]))
+        local dz = math.max(0, math.max(bounds1[3], bounds2[3]) - math.min(bounds1[6], bounds2[6]))
+        
+        return math.sqrt(dx*dx + dz*dz)
+    end,
+    
+    -- NEW: Spatial partitioning system for performance optimization
+    spatialPartition = {
+        octree = nil,
+        maxBodiesPerNode = 8,
+        maxDepth = 5
+    },
+    
+    -- Initialize spatial partitioning
+    initSpatialPartition = function()
+        PcombDetection.spatialPartition.octree = PcombDetection.createOctreeNode(
+            {-1000, -1000, -1000}, {1000, 1000, 1000}, 0
+        )
+    end,
+    
+    -- Create octree node
+    createOctreeNode = function(minBounds, maxBounds, depth)
+        return {
+            minBounds = minBounds,
+            maxBounds = maxBounds,
+            depth = depth,
+            bodies = {},
+            children = nil,
+            isLeaf = true
+        }
+    end,
+    
+    -- Insert body into octree
+    insertBodyIntoOctree = function(body, node)
+        if not node then return end
+        
+        local bodyPos = GetBodyTransform(body).pos
+        if not bodyPos then return end
+        
+        -- Check if body is within this node's bounds
+        if not PcombDetection.isPointInBounds(bodyPos, node.minBounds, node.maxBounds) then
+            return
+        end
+        
+        -- If node is leaf and not full, add body
+        if node.isLeaf and #node.bodies < PcombDetection.spatialPartition.maxBodiesPerNode then
+            table.insert(node.bodies, body)
+            return
+        end
+        
+        -- If node is leaf but full, subdivide
+        if node.isLeaf then
+            PcombDetection.subdivideOctreeNode(node)
+        end
+        
+        -- Insert into appropriate child
+        for i = 1, 8 do
+            if node.children[i] then
+                PcombDetection.insertBodyIntoOctree(body, node.children[i])
+            end
+        end
+    end,
+    
+    -- Subdivide octree node into 8 children
+    subdivideOctreeNode = function(node)
+        if not node.isLeaf then return end
+        
+        local midX = (node.minBounds[1] + node.maxBounds[1]) / 2
+        local midY = (node.minBounds[2] + node.maxBounds[2]) / 2
+        local midZ = (node.minBounds[3] + node.maxBounds[3]) / 2
+        
+        node.children = {
+            -- Bottom-front-left
+            PcombDetection.createOctreeNode(
+                {node.minBounds[1], node.minBounds[2], node.minBounds[3]},
+                {midX, midY, midZ},
+                node.depth + 1
+            ),
+            -- Bottom-front-right
+            PcombDetection.createOctreeNode(
+                {midX, node.minBounds[2], node.minBounds[3]},
+                {node.maxBounds[1], midY, midZ},
+                node.depth + 1
+            ),
+            -- Bottom-back-left
+            PcombDetection.createOctreeNode(
+                {node.minBounds[1], node.minBounds[2], midZ},
+                {midX, midY, node.maxBounds[3]},
+                node.depth + 1
+            ),
+            -- Bottom-back-right
+            PcombDetection.createOctreeNode(
+                {midX, node.minBounds[2], midZ},
+                {node.maxBounds[1], midY, node.maxBounds[3]},
+                node.depth + 1
+            ),
+            -- Top-front-left
+            PcombDetection.createOctreeNode(
+                {node.minBounds[1], midY, node.minBounds[3]},
+                {midX, node.maxBounds[2], midZ},
+                node.depth + 1
+            ),
+            -- Top-front-right
+            PcombDetection.createOctreeNode(
+                {midX, midY, node.minBounds[3]},
+                {node.maxBounds[1], node.maxBounds[2], midZ},
+                node.depth + 1
+            ),
+            -- Top-back-left
+            PcombDetection.createOctreeNode(
+                {node.minBounds[1], midY, midZ},
+                {midX, node.maxBounds[2], node.maxBounds[3]},
+                node.depth + 1
+            ),
+            -- Top-back-right
+            PcombDetection.createOctreeNode(
+                {midX, midY, midZ},
+                {node.maxBounds[1], node.maxBounds[2], node.maxBounds[3]},
+                node.depth + 1
+            )
+        }
+        
+        node.isLeaf = false
+        
+        -- Redistribute existing bodies to children
+        local existingBodies = node.bodies
+        node.bodies = {}
+        
+        for _, body in ipairs(existingBodies) do
+            PcombDetection.insertBodyIntoOctree(body, node)
+        end
+    end,
+    
+    -- Check if point is within bounds
+    isPointInBounds = function(point, minBounds, maxBounds)
+        return point[1] >= minBounds[1] and point[1] <= maxBounds[1] and
+               point[2] >= minBounds[2] and point[2] <= maxBounds[2] and
+               point[3] >= minBounds[3] and point[3] <= maxBounds[3]
+    end,
+    
+    -- Query bodies within radius using octree
+    queryBodiesInRadius = function(center, radius, node)
+        if not node then return {} end
+        
+        local result = {}
+        
+        -- Check if node's bounds intersect with query sphere
+        if not PcombDetection.boundsIntersectSphere(node.minBounds, node.maxBounds, center, radius) then
+            return result
+        end
+        
+        -- If leaf node, check all bodies
+        if node.isLeaf then
+            for _, body in ipairs(node.bodies) do
+                local bodyPos = GetBodyTransform(body).pos
+                if bodyPos and VecLength(VecSub(bodyPos, center)) <= radius then
+                    table.insert(result, body)
+                end
+            end
+        else
+            -- Recursively query children
+            for i = 1, 8 do
+                if node.children[i] then
+                    local childResults = PcombDetection.queryBodiesInRadius(center, radius, node.children[i])
+                    for _, body in ipairs(childResults) do
+                        table.insert(result, body)
+                    end
+                end
+            end
+        end
+        
+        return result
+    end,
+    
+    -- Check if AABB intersects with sphere
+    boundsIntersectSphere = function(minBounds, maxBounds, center, radius)
+        -- Validate bounds before arithmetic operations
+        if not minBounds or type(minBounds) ~= "table" or #minBounds < 3 or
+           not maxBounds or type(maxBounds) ~= "table" or #maxBounds < 3 or
+           not center or type(center) ~= "table" or #center < 3 or
+           not radius or type(radius) ~= "number" then
+            return false
+        end
+        
+        for i = 1, 3 do
+            if not minBounds[i] or type(minBounds[i]) ~= "number" or
+               not maxBounds[i] or type(maxBounds[i]) ~= "number" or
+               not center[i] or type(center[i]) ~= "number" then
+                return false
+            end
+        end
+        
+        local closest = {
+            math.max(minBounds[1], math.min(center[1], maxBounds[1])),
+            math.max(minBounds[2], math.min(center[2], maxBounds[2])),
+            math.max(minBounds[3], math.min(center[3], maxBounds[3]))
+        }
+        
+        local distance = VecLength(VecSub(closest, center))
+        return distance <= radius
+    end,
+    
+    -- NEW: Batch analyze structure for performance optimization
+    batchAnalyzeStructure = function(structureBodies, impactPoint)
+        local structureAnalysis = {
+            bodies = structureBodies,
+            totalMass = 0,
+            centerOfMass = {0, 0, 0},
+            supportAnalysis = {},
+            structuralIntegrity = 1.0,
+            collapseThreshold = 0.25, -- 25% base support threshold
+            chainReactionBodies = {},
+            forceDistribution = {}
+        }
+
+        -- Batch process bodies in chunks for performance
+        local batchSize = 10
+        local totalMass = 0
+        local weightedCOM = {0, 0, 0}
+
+        -- First pass: calculate total mass and center of mass
+        for i = 1, #structureBodies, batchSize do
+            local batchEnd = math.min(i + batchSize - 1, #structureBodies)
+
+            for j = i, batchEnd do
+                local body = structureBodies[j]
+                local bodyMass = GetBodyMass(body) or 0
+                local bodyCOM = GetBodyCenterOfMass(body)
+                local bodyTransform = GetBodyTransform(body)
+                local worldCOM = TransformToParentPoint(bodyTransform, bodyCOM)
+
+                totalMass = totalMass + bodyMass
+                weightedCOM[1] = weightedCOM[1] + (worldCOM[1] * bodyMass)
+                weightedCOM[2] = weightedCOM[2] + (worldCOM[2] * bodyMass)
+                weightedCOM[3] = weightedCOM[3] + (worldCOM[3] * bodyMass)
+            end
+        end
+
+        if totalMass > 0 then
+            structureAnalysis.centerOfMass = {
+                weightedCOM[1] / totalMass,
+                weightedCOM[2] / totalMass,
+                weightedCOM[3] / totalMass
+            }
+        end
+        structureAnalysis.totalMass = totalMass
+
+        -- Second pass: analyze support for each body in batches
+        for i = 1, #structureBodies, batchSize do
+            local batchEnd = math.min(i + batchSize - 1, #structureBodies)
+
+            for j = i, batchEnd do
+                local body = structureBodies[j]
+                -- NEW: Proactively convert static bodies to dynamic before analysis
+                -- This ensures all bodies in the structure can participate in physics simulation
+                if PcombDetection.isBodyStatic(body) then
+                    local converted = PcombDetection.convertStaticToDynamic(body)
+                    if not converted and GetBool("savegame.mod.pcomb.global.debug") then
+                        DebugPrint("Failed to convert static body in structure to dynamic: " .. tostring(body))
+                    end
+                end
+                
+                local bodyAnalysis = PcombDetection.analyzeBodySupport(body, impactPoint)
+                structureAnalysis.supportAnalysis[body] = bodyAnalysis
+
+                -- Track bodies that need collapse
+                if bodyAnalysis.needsCollapse then
+                    table.insert(structureAnalysis.chainReactionBodies, body)
+                end
+            end
+        end
+
+        -- Calculate structural integrity based on base support
+        structureAnalysis.structuralIntegrity = PcombDetection.calculateStructuralIntegrity(structureAnalysis)
+
+        -- Analyze force distribution across the structure
+        structureAnalysis.forceDistribution = PcombDetection.analyzeForceDistribution(structureAnalysis, impactPoint)
+
+        -- Determine if the entire structure needs to collapse
+        structureAnalysis.needsCollapse = structureAnalysis.structuralIntegrity < structureAnalysis.collapseThreshold
+
+        if GetBool("savegame.mod.pcomb.global.debug") then
+            DebugPrint("Batch multi-body analysis: " .. #structureBodies .. " bodies, integrity: " ..
+                      string.format("%.2f", structureAnalysis.structuralIntegrity) ..
+                      ", needs collapse: " .. tostring(structureAnalysis.needsCollapse))
+        end
+
+        return structureAnalysis
     end,
     
     -- NEW: Analyze weight distribution and calculate stability
     analyzeWeightDistribution = function(body, supportPoints)
         local bodyMass = GetBodyMass(body)
-        local centerOfMass = PcombDetection.calculateCenterOfMass(body)
+        local centerOfMass = GetBodyCenterOfMass(body)
         local gravityForce = {0, -bodyMass * 9.81, 0}  -- Gravity force vector
         
         -- Calculate torque from gravity around each potential pivot point
@@ -995,14 +1779,25 @@ PcombDetection = {
         local supportPoints = {}
         for _, supportBody in ipairs(supportAnalysis.supportingBodies) do
             local supportBounds = GetBodyBounds(supportBody)
-            if supportBounds then
-                -- Use the top surface of the supporting body as contact point
-                local contactPoint = {
-                    (supportBounds[1] + supportBounds[4]) / 2,  -- Center X
-                    supportBounds[5],  -- Top Y
-                    (supportBounds[3] + supportBounds[6]) / 2   -- Center Z
-                }
-                table.insert(supportPoints, contactPoint)
+            if supportBounds and type(supportBounds) == "table" and #supportBounds >= 6 then
+                -- Validate bounds array before arithmetic operations
+                local boundsValid = true
+                for i = 1, 6 do
+                    if not supportBounds[i] or type(supportBounds[i]) ~= "number" then
+                        boundsValid = false
+                        break
+                    end
+                end
+                
+                if boundsValid then
+                    -- Use the top surface of the supporting body as contact point
+                    local contactPoint = {
+                        (supportBounds[1] + supportBounds[4]) / 2,  -- Center X
+                        supportBounds[5],  -- Top Y
+                        (supportBounds[3] + supportBounds[6]) / 2   -- Center Z
+                    }
+                    table.insert(supportPoints, contactPoint)
+                end
             end
         end
         
@@ -1015,6 +1810,17 @@ PcombDetection = {
         
         -- Calculate stability metrics
         local bodyBounds = GetBodyBounds(body)
+        if not bodyBounds or type(bodyBounds) ~= "table" or #bodyBounds < 6 then
+            return {isStable = false, collapseDirection = "freefall", torqueRatio = 0}
+        end
+        
+        -- Validate bounds array before arithmetic operations
+        for i = 1, 6 do
+            if not bodyBounds[i] or type(bodyBounds[i]) ~= "number" then
+                return {isStable = false, collapseDirection = "freefall", torqueRatio = 0}
+            end
+        end
+        
         local bodyHeight = bodyBounds[5] - bodyBounds[2]
         local bodyMass = GetBodyMass(body)
         
@@ -1073,6 +1879,18 @@ PcombDetection = {
         end
         
         local bodyMass = GetBodyMass(body)
+        local bodyBounds = GetBodyBounds(body)
+        
+        -- Validate bodyBounds to prevent nil arithmetic errors
+        if not bodyBounds or type(bodyBounds) ~= "table" or #bodyBounds < 6 then
+            return false
+        end
+        for i = 1, 6 do
+            if not bodyBounds[i] or type(bodyBounds[i]) ~= "number" then
+                return false
+            end
+        end
+        
         local failureApplied = false
         
         -- Calculate failure strength based on material properties
@@ -1090,16 +1908,31 @@ PcombDetection = {
                 local damageRatio = (appliedTorque - connectionStrength) / connectionStrength
                 local damageAmount = math.min(damageRatio * 2.0, 5.0)  -- Cap damage
                 
-                -- Apply damage at connection point
-                local woodDamage = damageAmount * GetInt("savegame.mod.pcomb.ibsit.wood_damage") / 100
-                local stoneDamage = damageAmount * GetInt("savegame.mod.pcomb.ibsit.stone_damage") / 100
-                local metalDamage = damageAmount * GetInt("savegame.mod.pcomb.ibsit.metal_damage") / 100
-                
-                MakeHole(pivotData.point, woodDamage, stoneDamage, metalDamage)
-                failureApplied = true
-                
-                if GetBool("savegame.mod.pcomb.global.debug") then
-                    DebugPrint("Applied progressive failure damage: " .. damageAmount .. " at connection point")
+                -- Get bounds for damage position calculation
+                local supportBounds = GetBodyBounds(supportBody)
+                if supportBounds and type(supportBounds) == "table" and #supportBounds >= 6 then
+                    -- Validate bounds array before arithmetic operations
+                    local boundsValid = true
+                    for i = 1, 6 do
+                        if not supportBounds[i] or type(supportBounds[i]) ~= "number" then
+                            boundsValid = false
+                            break
+                        end
+                    end
+                    
+                    if boundsValid then
+                        -- Apply damage at connection point
+                        local woodDamage = damageAmount * GetInt("savegame.mod.pcomb.ibsit.wood_damage") / 100
+                        local stoneDamage = damageAmount * GetInt("savegame.mod.pcomb.ibsit.stone_damage") / 100
+                        local metalDamage = damageAmount * GetInt("savegame.mod.pcomb.ibsit.metal_damage") / 100
+                        
+                        MakeHole(pivotData.point, woodDamage, stoneDamage, metalDamage)
+                        failureApplied = true
+                        
+                        if GetBool("savegame.mod.pcomb.global.debug") then
+                            DebugPrint("Applied progressive failure damage: " .. damageAmount .. " at connection point")
+                        end
+                    end
                 end
             end
         end
@@ -1367,9 +2200,35 @@ PcombEffects = {
     end,
     
     processGravityCollapse = function(collapseCandidates)
+        -- NEW: Process multi-body structures first
+        local processedStructures = {}
+        
         for body, collapseData in pairs(collapseCandidates) do
             if collapseData.needsCollapse and IsBodyActive(body) then
-                PcombEffects.applyGravityCollapse(body, collapseData)
+                -- Check if this body is part of a larger structure
+                local jointedBodies = GetJointedBodies(body)
+                if jointedBodies and #jointedBodies > 0 then
+                    -- This is part of a multi-body structure, analyze the whole thing
+                    local structureKey = tostring(body) -- Use body pointer as key
+                    
+                    if not processedStructures[structureKey] then
+                        local impactPoint = collapseData.centerOfMass or {0, 0, 0}
+                        local structureAnalysis = PcombDetection.analyzeMultiBodyStructure(body, impactPoint)
+                        
+                        if structureAnalysis.needsCollapse then
+                            -- Process the entire structure with chain reactions
+                            PcombDetection.processChainReaction(structureAnalysis, impactPoint)
+                            
+                            -- Mark all bodies in this structure as processed
+                            for _, structBody in ipairs(structureAnalysis.bodies) do
+                                processedStructures[tostring(structBody)] = true
+                            end
+                        end
+                    end
+                else
+                    -- Single body collapse (fallback)
+                    PcombEffects.applyGravityCollapse(body, collapseData)
+                end
             end
         end
     end,
@@ -1907,6 +2766,18 @@ local pauseMenuButtons = {
     {name = "Debug Mode", key = "savegame.mod.pcomb.global.debug"}
 }
 
+-- Conversion settings for pause menu
+local pauseMenuSliders = {
+    {
+        name = "Size Threshold",
+        key = "savegame.mod.pcomb.conversion.size_threshold",
+        min = 0.1,
+        max = 5.0,
+        format = "%.1f",
+        multiplier = 10
+    }
+}
+
 -- Main Teardown Callbacks
 function init()
     PcombCore.init()
@@ -2020,6 +2891,32 @@ function draw(dt)
                 UiText(button.name .. " (" .. (isEnabled and "ON" or "OFF") .. ")")
             end
             
+            UiPop()
+        end
+        
+        -- Conversion settings sliders
+        for i, slider in ipairs(pauseMenuSliders) do
+            UiPush()
+            UiTranslate(0, -50 + (#pauseMenuButtons - 1) * 40 + i * 60)
+            UiAlign("left top")
+            UiFont("regular.ttf", 16)
+            UiColor(1, 1, 1)
+            UiText(slider.name)
+            UiTranslate(0, 25)
+            
+            -- Get current value
+            local currentValue = GetFloat(slider.key)
+            local displayValue = currentValue * (slider.multiplier or 1)
+            local newDisplayValue = UiSlider("ui/common/dot.png", "x", displayValue, slider.min * (slider.multiplier or 1), slider.max * (slider.multiplier or 1))
+            local newValue = newDisplayValue / (slider.multiplier or 1)
+            
+            if newValue ~= currentValue then
+                SetFloat(slider.key, newValue)
+            end
+            
+            -- Display current value
+            UiTranslate(320, -6)
+            UiText(string.format(slider.format, newValue))
             UiPop()
         end
         
