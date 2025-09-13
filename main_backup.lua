@@ -3,7 +3,7 @@
 -- Uses only official Teardown API functions
 
 -- Include centralized settings system
-#include "pcomb_settings.lua"
+dofile("pcomb_settings.lua")
 
 -- System Modules (included inline for standalone operation)
 local PcombCore = {}
