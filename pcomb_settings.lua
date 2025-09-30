@@ -74,6 +74,8 @@ PcombSettings.defaults = {
     ["savegame.mod.pcomb.ibsit.target_fps"] = 30,
     ["savegame.mod.pcomb.ibsit.volume"] = 0.7,
     ["savegame.mod.pcomb.ibsit.particle_quality"] = 2,
+    -- Vehicle toggle: when true, IBSIT will process vehicle integrity; when false, vehicles are ignored
+    ["savegame.mod.pcomb.vehicles.enabled"] = false,
 
     -- MBCS settings
     ["savegame.mod.pcomb.mbcs.enabled"] = true,
@@ -282,6 +284,8 @@ function PcombSettings.drawGlobalTab()
     PcombSettings.UiBoolOption("Enable PRGD System", "savegame.mod.pcomb.prgd.enabled")
     PcombSettings.UiBoolOption("Enable IBSIT System", "savegame.mod.pcomb.ibsit.enabled")
     PcombSettings.UiBoolOption("Enable MBCS System", "savegame.mod.pcomb.mbcs.enabled")
+    -- Vehicle processing toggle
+    PcombSettings.UiBoolOption("Apply Mod Physics to Vehicles", "savegame.mod.pcomb.vehicles.enabled")
 end
 
 function PcombSettings.drawPRGDCoreTab()

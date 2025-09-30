@@ -437,13 +437,19 @@ PcombDetection = {
                     -- Check if body is within reasonable distance of breakpoint
                     local distance = VecLength(VecSub(bodyPos, breakpoint))
                     if distance <= breaksize * searchMultiplier then
-                        local collapseData = PcombDetection.analyzeBodySupport(body, breakpoint)
-                        if collapseData.needsCollapse then
-                            collapseCandidates[body] = collapseData
-                            
-                            if GetBool("savegame.mod.pcomb.global.debug") then
-                                DebugPrint("Body " .. tostring(body) .. " marked for collapse (distance: " .. 
-                                          string.format("%.2f", distance) .. ")")
+                        -- Skip vehicle bodies if vehicle processing is disabled
+                        local vehicleHandle = GetBodyVehicle(body)
+                        if vehicleHandle and not GetBool("savegame.mod.pcomb.vehicles.enabled") then
+                            -- do nothing, skip vehicle
+                        else
+                            local collapseData = PcombDetection.analyzeBodySupport(body, breakpoint)
+                            if collapseData.needsCollapse then
+                                collapseCandidates[body] = collapseData
+
+                                if GetBool("savegame.mod.pcomb.global.debug") then
+                                    DebugPrint("Body " .. tostring(body) .. " marked for collapse (distance: " .. 
+                                              string.format("%.2f", distance) .. ")")
+                                end
                             end
                         end
                     end
@@ -461,6 +467,12 @@ PcombDetection = {
     end,
     
     analyzeBodySupport = function(body, impactPoint)
+        -- Respect vehicle processing toggle: skip vehicle bodies when disabled
+        local vehicleHandle = GetBodyVehicle(body)
+        if vehicleHandle and not GetBool("savegame.mod.pcomb.vehicles.enabled") then
+            return {needsCollapse = false}
+        end
+
         -- NEW: Convert static bodies to dynamic before analysis
         -- This ensures bodies can participate in physics simulation for collapse/impact
         if PcombDetection.isBodyStatic(body) then
@@ -1152,6 +1164,15 @@ PcombDetection = {
     
     -- NEW: Convert a static body to dynamic so it can participate in physics
     convertStaticToDynamic = function(body)
+        -- Respect vehicle processing toggle: do not convert vehicle bodies when disabled
+        local vehicleHandle = GetBodyVehicle(body)
+        if vehicleHandle and not GetBool("savegame.mod.pcomb.vehicles.enabled") then
+            if GetBool("savegame.mod.pcomb.global.debug") then
+                DebugPrint("Skipping conversion of vehicle body: " .. tostring(body))
+            end
+            return false
+        end
+
         if not PcombDetection.isBodyStatic(body) then return false end
         
         -- NEW: Check body size threshold to avoid converting small debris
@@ -1938,7 +1959,7 @@ PcombDetection = {
         
         -- Material-specific stability factors
         local materialStabilityFactor = materialProps.collapseResistance
-        local brittlenessFactor = 1 - materialStabilityFactor  -- Brittle materials are less stable
+        local brittlenessFactor = 1 - materialStabilityFactor  -- Britle materials are less stable
         
         -- Calculate stability ratio: support torque vs weight torque
         local stabilityRatio = weightAnalysis.minStabilityTorque / (bodyMass * bodyHeight * brittlenessFactor)
@@ -2023,7 +2044,7 @@ PcombDetection = {
                 -- Get bounds for damage position calculation
                 local supportBounds = GetBodyBounds(supportBody)
                 if supportBounds and type(supportBounds) == "table" and #supportBounds >= 6 then
-                    -- Validate bounds array before arithmetic operations
+                    -- Validate bounds array before arithmetic
                     local boundsValid = true
                     for i = 1, 6 do
                         if not supportBounds[i] or type(supportBounds[i]) ~= "number" then
@@ -2038,7 +2059,7 @@ PcombDetection = {
                         local stoneDamage = damageAmount * GetInt("savegame.mod.pcomb.ibsit.stone_damage") / 100
                         local metalDamage = damageAmount * GetInt("savegame.mod.pcomb.ibsit.metal_damage") / 100
                         
-                        MakeHole(pivotData.point, woodDamage, stoneDamage, metalDamage)
+                        safeMakeHole(pivotData.point, woodDamage, stoneDamage, metalDamage)
                         failureApplied = true
                         
                         if GetBool("savegame.mod.pcomb.global.debug") then
@@ -2053,7 +2074,37 @@ PcombDetection = {
     end
 }
 
--- Effects and Visual Systems Module
+-- Vehicle-safe helpers for root module
+local function isVehicleBody(body)
+    if not body then return false end
+    local vh = GetBodyVehicle(body)
+    return vh and vh ~= 0
+end
+
+local function safeApplyBodyImpulse(body, pos, vel)
+    if isVehicleBody(body) and not GetBool("savegame.mod.pcomb.vehicles.enabled") then
+        return nil
+    end
+    return ApplyBodyImpulse(body, pos, vel)
+end
+
+local function safeMakeHole(pos, wood, stone, metal)
+    if not GetBool("savegame.mod.pcomb.vehicles.enabled") then
+        local r = 1.0
+        local mi = VecSub(pos, Vec(r, r, r))
+        local ma = VecAdd(pos, Vec(r, r, r))
+        QueryRequire("physical")
+        local bodies = QueryAabbBodies(mi, ma)
+        for i = 1, #bodies do
+            local b = bodies[i]
+            if GetBodyVehicle(b) and GetBodyVehicle(b) ~= 0 then
+                return 0
+            end
+        end
+    end
+    return MakeHole(pos, wood, stone, metal)
+end
+
 PcombEffects = {
     -- Track falling bodies for impact damage
     fallingBodies = {},
@@ -2116,6 +2167,12 @@ PcombEffects = {
     end,
     
     createCrumbleEffect = function(body, position)
+        -- Respect centralized vehicle toggle: skip vehicle bodies when disabled
+        local vehicleHandle = GetBodyVehicle(body)
+        if vehicleHandle and not GetBool("savegame.mod.pcomb.vehicles.enabled") then
+            return
+        end
+
         local shapes = GetBodyShapes(body)
         if #shapes == 0 then return end
         
@@ -2157,7 +2214,7 @@ PcombEffects = {
                     local stoneDamage = mediumDamage * (mass * 0.008) * sizeMultiplier
                     local metalDamage = heavyDamage * (mass * 0.008) * sizeMultiplier
                     
-                    MakeHole(holePos, woodDamage, stoneDamage, metalDamage)
+                    safeMakeHole(holePos, woodDamage, stoneDamage, metalDamage)
                 end
             end
         end
@@ -2165,7 +2222,13 @@ PcombEffects = {
     
     createStructuralEffects = function(body, integrityLoss, position)
         if not GetBool("savegame.mod.pcomb.ibsit.particles") then return end
-        
+
+        -- Respect centralized vehicle toggle: skip vehicle bodies when disabled
+        local vehicleHandle = GetBodyVehicle(body)
+        if vehicleHandle and not GetBool("savegame.mod.pcomb.vehicles.enabled") then
+            return
+        end
+
         -- Get material at break point
         local shapes = GetBodyShapes(body)
         if #shapes == 0 then return end
@@ -2233,6 +2296,12 @@ PcombEffects = {
     end,
     
     createCollapseEffects = function(body, triggerData, position)
+        -- Respect centralized vehicle toggle: skip vehicle bodies when disabled
+        local vehicleHandle = GetBodyVehicle(body)
+        if vehicleHandle and not GetBool("savegame.mod.pcomb.vehicles.enabled") then
+            return
+        end
+
         -- Create MBCS-style collapse particles
         local shapes = GetBodyShapes(body)
         if #shapes == 0 then return end
@@ -2266,7 +2335,7 @@ PcombEffects = {
                     
                     local damageMultiplier = triggerData.triggerStrength * 0.5
                     
-                    MakeHole(center, 
+                    safeMakeHole(center, 
                         woodDamage * damageMultiplier,
                         stoneDamage * damageMultiplier, 
                         metalDamage * damageMultiplier
@@ -2348,6 +2417,15 @@ PcombEffects = {
     applyGravityCollapse = function(body, collapseData)
         -- NEW: Ensure body is dynamic before applying gravity forces
         -- This is a final safety check in case static conversion was missed earlier
+        -- Respect centralized vehicle toggle: skip vehicle bodies when disabled
+        local vehicleHandle = GetBodyVehicle(body)
+        if vehicleHandle and not GetBool("savegame.mod.pcomb.vehicles.enabled") then
+            if GetBool("savegame.mod.pcomb.global.debug") then
+                DebugPrint("Skipping gravity collapse for vehicle body: " .. tostring(body))
+            end
+            return
+        end
+
         if PcombDetection.isBodyStatic(body) then
             local converted = PcombDetection.convertStaticToDynamic(body)
             if not converted then
@@ -2404,7 +2482,7 @@ PcombEffects = {
         end
         
         -- Apply the calculated forces
-        ApplyBodyImpulse(body, centerOfMass, directionalForces)
+        safeApplyBodyImpulse(body, centerOfMass, directionalForces)
         
         -- Material-specific instability (brittle materials are more unstable)
         local instability = collapseStrength * (1 - materialProps.collapseResistance) * 0.5
@@ -2412,7 +2490,7 @@ PcombEffects = {
         local randomZ = (math.random() - 0.5) * instability * bodyMass
         
         if instability > 0.1 then
-            ApplyBodyImpulse(body, centerOfMass, {randomX, 0, randomZ})
+            safeApplyBodyImpulse(body, centerOfMass, {randomX, 0, randomZ})
         end
         
         -- NEW: Track this body as falling for impact damage
@@ -2581,6 +2659,12 @@ PcombEffects = {
     
     -- NEW: Track falling body for impact damage calculation
     trackFallingBody = function(body, collapseData)
+        -- NEW: Respect centralized vehicle toggle: do not track vehicle bodies when disabled
+        local vehicleHandle = GetBodyVehicle(body)
+        if vehicleHandle and not GetBool("savegame.mod.pcomb.vehicles.enabled") then
+            return
+        end
+
         -- NEW: Ensure body is dynamic before tracking for impact damage
         if PcombDetection.isBodyStatic(body) then
             local converted = PcombDetection.convertStaticToDynamic(body)
@@ -2717,44 +2801,51 @@ PcombEffects = {
         
         for _, nearbyBody in ipairs(nearbyBodies) do
             if nearbyBody ~= body and IsBodyActive(nearbyBody) then
-                -- Calculate damage based on distance from impact
-                local bodyPos = GetBodyTransform(nearbyBody).pos
-                if bodyPos and impactPosition then
-                    local distance = VecLength(VecSub(bodyPos, impactPosition))
-                    local distanceFactor = 0
-                    if impactRadius and impactRadius > 0 then
-                        distanceFactor = math.max(0, 1 - (distance / impactRadius))
-                    end
-
-                    if distanceFactor > 0.1 then
-                        local damageToApply = finalDamage * distanceFactor
-
-                        -- Apply damage to shapes in the body
-                        local shapes = GetBodyShapes(nearbyBody)
-                        for _, shape in ipairs(shapes) do
-                            local shapeBounds = GetShapeBounds(shape)
-                            if shapeBounds and shapeBounds[1] and shapeBounds[2] and shapeBounds[3] and shapeBounds[4] and shapeBounds[5] and shapeBounds[6] then
-                                -- Calculate damage position within shape bounds
-                                local damagePos = {
-                                    shapeBounds[1] + (shapeBounds[4] - shapeBounds[1]) * math.random(),
-                                    shapeBounds[2] + (shapeBounds[5] - shapeBounds[2]) * math.random(),
-                                    shapeBounds[3] + (shapeBounds[6] - shapeBounds[3]) * math.random()
-                                }
-
-                                -- Apply damage based on material
-                                local woodDamage = damageToApply * GetInt("savegame.mod.pcomb.ibsit.wood_damage") / 100
-                                local stoneDamage = damageToApply * GetInt("savegame.mod.pcomb.ibsit.stone_damage") / 100
-                                local metalDamage = damageToApply * GetInt("savegame.mod.pcomb.ibsit.metal_damage") / 100
-
-                                MakeHole(damagePos, woodDamage, stoneDamage, metalDamage)
-                            end
+                -- Skip vehicle bodies when vehicle processing is disabled
+                local nearbyVeh = GetBodyVehicle(nearbyBody)
+                if nearbyVeh and not GetBool("savegame.mod.pcomb.vehicles.enabled") then
+                    -- explicitly skip this nearby body
+                else
+                    -- Calculate damage based on distance from impact
+                    local bt = GetBodyTransform(nearbyBody)
+                    local bodyPos = bt and bt.pos
+                    if bodyPos and impactPosition then
+                        local distance = VecLength(VecSub(bodyPos, impactPosition))
+                        local distanceFactor = 0
+                        if impactRadius and impactRadius > 0 then
+                            distanceFactor = math.max(0, 1 - (distance / impactRadius))
                         end
 
-                        -- Create impact effects
-                        PcombEffects.createImpactEffects(impactPosition, finalDamage, fallData.materialProps and fallData.materialProps.name)
+                        if distanceFactor > 0.1 then
+                            local damageToApply = finalDamage * distanceFactor
 
-                        -- Play impact sound
-                        PcombEffects.playImpactSound(impactPosition, finalDamage, fallData.materialProps and fallData.materialProps.name)
+                            -- Apply damage to shapes in the body
+                            local shapes = GetBodyShapes(nearbyBody)
+                            for _, shape in ipairs(shapes) do
+                                local shapeBounds = GetShapeBounds(shape)
+                                if shapeBounds and shapeBounds[1] and shapeBounds[2] and shapeBounds[3] and shapeBounds[4] and shapeBounds[5] and shapeBounds[6] then
+                                    -- Calculate damage position within shape bounds
+                                    local damagePos = {
+                                        shapeBounds[1] + (shapeBounds[4] - shapeBounds[1]) * math.random(),
+                                        shapeBounds[2] + (shapeBounds[5] - shapeBounds[2]) * math.random(),
+                                        shapeBounds[3] + (shapeBounds[6] - shapeBounds[3]) * math.random()
+                                    }
+
+                                    -- Apply damage based on material
+                                    local woodDamage = damageToApply * GetInt("savegame.mod.pcomb.ibsit.wood_damage") / 100
+                                    local stoneDamage = damageToApply * GetInt("savegame.mod.pcomb.ibsit.stone_damage") / 100
+                                    local metalDamage = damageToApply * GetInt("savegame.mod.pcomb.ibsit.metal_damage") / 100
+
+                                    safeMakeHole(damagePos, woodDamage, stoneDamage, metalDamage)
+                                end
+                            end
+
+                            -- Create impact effects
+                            PcombEffects.createImpactEffects(impactPosition, finalDamage, fallData.materialProps and fallData.materialProps.name)
+
+                            -- Play impact sound
+                            PcombEffects.playImpactSound(impactPosition, finalDamage, fallData.materialProps and fallData.materialProps.name)
+                        end
                     end
                 end
             end
