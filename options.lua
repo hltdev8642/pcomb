@@ -98,5 +98,7 @@ function draw()
         PcombSettings.drawPerformanceTab()
     elseif currentTab == 8 then
         PcombSettings.drawMaterialsTab()
+    elseif currentTab == 9 then
+        PcombSettings.drawProfilesTab() -- Profiles UI
     end
 end

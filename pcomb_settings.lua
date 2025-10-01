@@ -13,7 +13,8 @@ PcombSettings.tabs = {
     "IBSIT Advanced",
     "MBCS",
     "Performance",
-    "Materials"
+    "Materials",
+    "Profiles" -- Added Profiles tab
 }
 
 -- Settings registry keys and their default values
@@ -104,7 +105,13 @@ PcombSettings.defaults = {
     ["savegame.mod.pcomb.impact.radius"] = 2.0,
 
     -- Conversion settings
-    ["savegame.mod.pcomb.conversion.size_threshold"] = 1.0
+    ["savegame.mod.pcomb.conversion.size_threshold"] = 1.0,
+
+    -- Profile UI helpers
+    ["savegame.mod.pcomb.last_profile_op"] = "",
+    ["savegame.mod.pcomb.last_export"] = "",
+    -- persistent counter used as fallback timestamp when os is unavailable
+    ["savegame.mod.pcomb.profile_counter"] = 0,
 }
 
 -- Initialize all default values if they don't exist
@@ -932,4 +939,388 @@ function PcombSettings.drawMaterialsTab()
     end
     UiTranslate(0, 80)
     UiColor(1, 1, 1)
+end
+
+-- Profiles management utilities
+-- Serialize a simple Lua table (numbers, booleans, strings, nested tables)
+function PcombSettings._serializeValue(v)
+    if type(v) == "number" then
+        return tostring(v)
+    elseif type(v) == "boolean" then
+        return tostring(v)
+    elseif type(v) == "string" then
+        -- escape backslashes and quotes
+        local s = v:gsub("\\", "\\\\"):gsub('"', '\\"')
+        return '"' .. s .. '"'
+    elseif type(v) == "table" then
+        return PcombSettings.serializeTable(v)
+    else
+        return 'nil'
+    end
+end
+
+function PcombSettings.serializeTable(t)
+    local function serialize(tbl, indent)
+        indent = indent or ""
+        local parts = {"{"}
+        local nextIndent = indent .. "  "
+        for k, v in pairs(tbl) do
+            local keyRep
+            if type(k) == "number" then
+                keyRep = "[" .. tostring(k) .. "]"
+            else
+                keyRep = "[" .. PcombSettings._serializeValue(k) .. "]"
+            end
+            local valRep = PcombSettings._serializeValue(v)
+            table.insert(parts, nextIndent .. keyRep .. " = " .. valRep .. ",")
+        end
+        table.insert(parts, indent .. "}")
+        return table.concat(parts, "\n")
+    end
+    return serialize(t, "")
+end
+
+function PcombSettings.deserializeTable(str)
+    if not str or str == "" then return nil end
+    local chunk, err = loadstring("return " .. str)
+    if not chunk then
+        -- try without wrapping
+        chunk, err = loadstring(str)
+        if not chunk then
+            return nil, "Failed to parse profile data: " .. tostring(err)
+        end
+    end
+    local ok, res = pcall(chunk)
+    if not ok then
+        return nil, "Failed to run profile chunk: " .. tostring(res)
+    end
+    if type(res) ~= "table" then
+        return nil, "Profile did not evaluate to a table"
+    end
+    return res
+end
+
+-- Profile storage: profiles are kept in registry under savegame.mod.pcomb.profiles.<name>.data (string)
+function PcombSettings.listProfiles()
+    local parent = "savegame.mod.pcomb.profiles"
+    -- ListKeys may return child names like 'profile_1.data' or 'profile_1.meta'. Collect unique base names.
+    local children = ListKeys(parent) or {}
+    local names_map = {}
+    for i = 1, #children do
+        local child = tostring(children[i])
+        -- Extract base name before first dot (if any)
+        local base = child:match("^([^%.]+)")
+        if base and base ~= "" then
+            names_map[base] = true
+        end
+    end
+    local names = {}
+    for n, _ in pairs(names_map) do table.insert(names, n) end
+    table.sort(names)
+    return names
+end
+
+-- Helper constant for prefix to avoid off-by-one errors
+local PCOMB_PREFIX = "savegame.mod.pcomb."
+local PCOMB_PREFIX_LEN = string.len(PCOMB_PREFIX)
+
+function PcombSettings._getTimeValue()
+    if type(os) == "table" and type(os.time) == "function" then
+        return os.time()
+    end
+    PcombSettings._ensureProfileCounter()
+    return GetInt("savegame.mod.pcomb.profile_counter")
+end
+
+function PcombSettings.saveProfile(name)
+    if not name or name == "" then return false, "Invalid name" end
+    local data = {}
+    -- Collect all known keys and their current values
+    for fullKey, defaultValue in pairs(PcombSettings.defaults) do
+        if string.sub(fullKey, 1, PCOMB_PREFIX_LEN) == PCOMB_PREFIX then
+            local shortKey = string.sub(fullKey, PCOMB_PREFIX_LEN + 1)
+            data[shortKey] = PcombSettings.get(fullKey)
+        end
+    end
+    local s = PcombSettings.serializeTable(data)
+    SetString("savegame.mod.pcomb.profiles." .. name .. ".data", s)
+    -- use safe time helper instead of os.time()
+    SetString("savegame.mod.pcomb.profiles." .. name .. ".meta", "saved_at=" .. tostring(PcombSettings._getTimeValue()))
+
+    -- Diagnostics: store size and entries for quick verification
+    local entries = 0
+    for _ in pairs(data) do entries = entries + 1 end
+    SetInt("savegame.mod.pcomb.profiles." .. name .. ".entries", entries)
+    SetInt("savegame.mod.pcomb.profiles." .. name .. ".size", #s)
+    SetString("savegame.mod.pcomb.last_profile_op", "Saved: " .. name .. " (entries=" .. tostring(entries) .. ", size=" .. tostring(#s) .. ")")
+    return true
+end
+function PcombSettings._ensureProfileCounter()
+    if not HasKey("savegame.mod.pcomb.profile_counter") then
+        SetInt("savegame.mod.pcomb.profile_counter", 0)
+    end
+end
+function PcombSettings.deleteProfile(name)
+    if not name or name == "" then return false, "Invalid name" end
+    ClearKey("savegame.mod.pcomb.profiles." .. name)
+    return true
+end
+function PcombSettings._getTimestampString()
+    if type(os) == "table" and type(os.date) == "function" and type(os.time) == "function" then
+        local ok, s = pcall(function() return os.date("%Y%m%d_%H%M%S", os.time()) end)
+        if ok and s then return s end
+    end
+    -- fallback: use incrementing counter to ensure uniqueness
+    local cnt = PcombSettings._nextProfileCounter()
+    return tostring(cnt)
+end
+
+-- Helper: increment and return next counter value (used to generate unique names)
+function PcombSettings._nextProfileCounter()
+    PcombSettings._ensureProfileCounter()
+    local cur = GetInt("savegame.mod.pcomb.profile_counter")
+    cur = cur + 1
+    SetInt("savegame.mod.pcomb.profile_counter", cur)
+    return cur
+end
+-- Reset all settings to default values (force write)
+function PcombSettings.resetAllToDefaults()
+    for key, defaultValue in pairs(PcombSettings.defaults) do
+        if type(defaultValue) == "boolean" then
+            SetBool(key, defaultValue)
+        elseif type(defaultValue) == "number" then
+            if math.floor(defaultValue) == defaultValue then
+                SetInt(key, defaultValue)
+            else
+                SetFloat(key, defaultValue)
+            end
+        end
+    end
+end
+-- New helper: check if the environment provides io.open and a safe wrapper to call it.
+function PcombSettings._ioAvailable()
+    return type(io) == "table" and type(io.open) == "function"
+end
+
+function PcombSettings._safeIoOpen(...)
+    if not PcombSettings._ioAvailable() then
+        return nil, "IO library unavailable in this environment"
+    end
+    return io.open(...)
+end
+
+function PcombSettings._getTimeValue()
+    if type(os) == "table" and type(os.time) == "function" then
+        return os.time()
+    end
+    PcombSettings._ensureProfileCounter()
+    return GetInt("savegame.mod.pcomb.profile_counter")
+end
+
+function PcombSettings.loadProfile(name)
+    if not name or name == "" then return false, "Invalid name" end
+    local profileKey = "savegame.mod.pcomb.profiles." .. name .. ".data"
+    if not HasKey(profileKey) then
+        return false, "Profile not found"
+    end
+    local s = GetString(profileKey)
+    local tbl, err = PcombSettings.deserializeTable(s)
+    if not tbl then return false, err end
+
+    -- Apply each entry to registry and track diagnostics
+    local applied = 0
+    local changed = 0
+    local unknown = 0
+    for shortKey, value in pairs(tbl) do
+        local fullKey = PCOMB_PREFIX .. shortKey
+        if PcombSettings.defaults[fullKey] ~= nil then
+            local defaultValue = PcombSettings.defaults[fullKey]
+            local oldVal = PcombSettings.get(fullKey)
+            -- Use typed set
+            if type(defaultValue) == "boolean" then
+                SetBool(fullKey, value)
+            elseif type(defaultValue) == "number" then
+                if math.floor(defaultValue) == defaultValue then
+                    SetInt(fullKey, value)
+                else
+                    SetFloat(fullKey, value)
+                end
+            else
+                SetString(fullKey, tostring(value))
+            end
+            applied = applied + 1
+            if oldVal ~= PcombSettings.get(fullKey) then
+                changed = changed + 1
+            end
+        else
+            -- Unknown key: do NOT write into main registry namespace to avoid polluting settings.
+            -- Store unknown profile-specific entries under profiles.<name>.<shortKey>
+            SetString("savegame.mod.pcomb.profiles." .. name .. ".extra." .. shortKey, tostring(value))
+            unknown = unknown + 1
+        end
+    end
+
+    -- Diagnostics
+    SetInt("savegame.mod.pcomb.profiles." .. name .. ".applied", applied)
+    SetInt("savegame.mod.pcomb.profiles." .. name .. ".changed", changed)
+    SetInt("savegame.mod.pcomb.profiles." .. name .. ".unknown", unknown)
+    SetString("savegame.mod.pcomb.last_profile_op", "Loaded: " .. name .. " (applied=" .. tostring(applied) .. ", changed=" .. tostring(changed) .. ", unknown=" .. tostring(unknown) .. ")")
+
+    return true
+end
+
+-- Export profile to a Lua file under MOD/pcomb_profiles/<name>.lua if possible
+function PcombSettings.exportProfileToFile(name)
+    local ok, err = PcombSettings.loadProfile(name)
+    if not ok then return false, err end
+    -- Rebuild table from registry, the same as saveProfile
+    local data = {}
+    for fullKey, defaultValue in pairs(PcombSettings.defaults) do
+        if string.sub(fullKey, 1, PCOMB_PREFIX_LEN) == PCOMB_PREFIX then
+            local shortKey = string.sub(fullKey, PCOMB_PREFIX_LEN + 1)
+            data[shortKey] = PcombSettings.get(fullKey)
+        end
+    end
+    local s = "return " .. PcombSettings.serializeTable(data)
+    local folder = "MOD/pcomb_profiles"
+    -- Attempt to create a profiles folder (best-effort) using safe helper
+    pcall(function() PcombSettings._safeMakeDir(folder) end)
+
+    local filename = folder .. "/" .. name .. ".lua"
+
+    -- Use safe io wrapper to avoid indexing a nil global 'io' in restricted environments.
+    local f, ferr = PcombSettings._safeIoOpen(filename, "w")
+    if not f then
+        -- Fallback: store exported text in registry so user still has access to it
+        SetString("savegame.mod.pcomb.profiles." .. name .. ".exported_text", s)
+        SetString("savegame.mod.pcomb.last_export", "registry:savegame.mod.pcomb.profiles." .. name .. ".exported_text")
+        return false, "Failed to open file for writing: " .. tostring(ferr) .. ". Profile exported to registry key savegame.mod.pcomb.profiles." .. name .. ".exported_text"
+    end
+    f:write(s)
+    f:close()
+    SetString("savegame.mod.pcomb.last_export", filename)
+    return true, filename
+end
+
+-- Import profile from a Lua file (expects file to return a table)
+function PcombSettings.importProfileFromFile(name, filepath)
+    if not filepath or filepath == "" then
+        return false, "No filepath provided"
+    end
+
+    local f, ferr = PcombSettings._safeIoOpen(filepath, "r")
+    if not f then
+        return false, "Failed to open file: " .. tostring(ferr)
+    end
+    local content = f:read("*a")
+    f:close()
+    -- Try to parse
+    local tbl, err = PcombSettings.deserializeTable(content:gsub("^return%s+", ""))
+    if not tbl then return false, err end
+    -- Save as profile with provided name
+    SetString("savegame.mod.pcomb.profiles." .. name .. ".data", PcombSettings.serializeTable(tbl))
+    -- use safe time helper instead of os.time()
+    SetString("savegame.mod.pcomb.profiles." .. name .. ".meta", "imported_from=" .. tostring(filepath) .. ";time=" .. tostring(PcombSettings._getTimeValue()))
+    return true
+end
+
+-- Draw the Profiles UI tab
+function PcombSettings.drawProfilesTab()
+    UiAlign("left top")
+    UiFont("regular.ttf", 18)
+
+    UiText("Profiles Manager")
+    UiTranslate(0, 30)
+
+    -- Create new profile (auto-generated name)
+    if UiTextButton("Create New Profile (auto-name)", 320, 30) then
+        -- use safe timestamp helper instead of os.date()
+        local t = PcombSettings._getTimestampString()
+        local name = "profile_" .. t
+        local ok, err = PcombSettings.saveProfile(name)
+        if not ok then
+            SetString("savegame.mod.pcomb.last_profile_op", "Error creating profile: " .. tostring(err))
+        else
+            SetString("savegame.mod.pcomb.last_profile_op", "Created profile: " .. name)
+        end
+    end
+    UiTranslate(0, 40)
+
+    UiText("Existing Profiles:")
+    UiTranslate(0, 20)
+
+    local profiles = PcombSettings.listProfiles()
+    if #profiles == 0 then
+        UiText("(No profiles found)")
+    else
+        for i = 1, #profiles do
+            local name = profiles[i]
+            UiPush()
+            UiFont("regular.ttf", 16)
+            UiText(name)
+            UiTranslate(240, -2)
+            UiPush()
+            if UiTextButton("Load", 80, 24) then
+                local ok, err = PcombSettings.loadProfile(name)
+                if not ok then
+                    SetString("savegame.mod.pcomb.last_profile_op", "Load failed: " .. tostring(err))
+                else
+                    SetString("savegame.mod.pcomb.last_profile_op", "Loaded: " .. name)
+                end
+            end
+            UiTranslate(90, 0)
+            if UiTextButton("Save (Overwrite)", 140, 24) then
+                local ok, err = PcombSettings.saveProfile(name)
+                if not ok then
+                    SetString("savegame.mod.pcomb.last_profile_op", "Save failed: " .. tostring(err))
+                else
+                    SetString("savegame.mod.pcomb.last_profile_op", "Saved: " .. name)
+                end
+            end
+            UiTranslate(150, 0)
+            if UiTextButton("Delete", 80, 24) then
+                PcombSettings.deleteProfile(name)
+                SetString("savegame.mod.pcomb.last_profile_op", "Deleted: " .. name)
+            end
+            UiTranslate(-240, 28)
+            UiPop()
+            UiPop()
+            UiTranslate(0, 34)
+        end
+    end
+
+    UiTranslate(0, 24)
+    UiText("Advanced Operations:")
+    UiTranslate(0, 20)
+
+    UiPush()
+    if UiTextButton("Reset All Settings to Defaults", 320, 28) then
+        PcombSettings.resetAllToDefaults()
+        SetString("savegame.mod.pcomb.last_profile_op", "All settings reset to defaults")
+    end
+    UiPop()
+
+    UiTranslate(0, 34)
+    UiText("Export / Import (files placed under MOD/pcomb_profiles/<name>.lua)")
+    UiTranslate(0, 20)
+    -- Export last created or selected profile
+    if UiTextButton("Export Selected Profiles to MOD/pcomb_profiles/<name>.lua", 520, 28) then
+        local profiles = PcombSettings.listProfiles()
+        if profiles and #profiles > 0 then
+            -- Export all for convenience
+            local successes = 0
+            for i=1,#profiles do
+                local ok, fnameOrErr = PcombSettings.exportProfileToFile(profiles[i])
+                if ok then successes = successes + 1 end
+            end
+            SetString("savegame.mod.pcomb.last_profile_op", "Exported " .. tostring(successes) .. " profiles (if any)")
+        else
+            SetString("savegame.mod.pcomb.last_profile_op", "No profiles to export")
+        end
+    end
+
+    UiTranslate(0, 34)
+    UiText("Last operation: " .. (GetString("savegame.mod.pcomb.last_profile_op") or "none"))
+    UiTranslate(0, 10)
+    UiText("Last export file: " .. (GetString("savegame.mod.pcomb.last_export") or "none"))
 end
