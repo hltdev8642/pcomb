@@ -14,7 +14,8 @@ PcombSettings.tabs = {
     "MBCS",
     "Performance",
     "Materials",
-    "Profiles" -- Added Profiles tab
+    "Ground Detection",
+    "Profiles" -- Added Profiles tab (moved)
 }
 
 -- Settings registry keys and their default values
@@ -75,6 +76,14 @@ PcombSettings.defaults = {
     ["savegame.mod.pcomb.ibsit.target_fps"] = 30,
     ["savegame.mod.pcomb.ibsit.volume"] = 0.7,
     ["savegame.mod.pcomb.ibsit.particle_quality"] = 2,
+    -- Collision settings
+    ["savegame.mod.pcomb.ibsit.collision.enabled"] = true,
+    ["savegame.mod.pcomb.ibsit.collision.acceleration_threshold"] = 50.0,
+    ["savegame.mod.pcomb.ibsit.collision.min_speed"] = 2.0,
+    ["savegame.mod.pcomb.ibsit.collision.damage_multiplier"] = 1.0,
+    ["savegame.mod.pcomb.ibsit.collision.radius"] = 1.5,
+    ["savegame.mod.pcomb.ibsit.collision.secondary_damage"] = 0.5,
+    ["savegame.mod.pcomb.ibsit.collision.secondary_distance"] = 0.2,
     -- Vehicle toggle: when true, IBSIT will process vehicle integrity; when false, vehicles are ignored
     ["savegame.mod.pcomb.vehicles.enabled"] = false,
 
@@ -106,6 +115,13 @@ PcombSettings.defaults = {
 
     -- Conversion settings
     ["savegame.mod.pcomb.conversion.size_threshold"] = 1.0,
+    -- Ground detection settings
+    ["savegame.mod.pcomb.ground_detection.enabled"] = true,
+    ["savegame.mod.pcomb.ground_detection.area_threshold"] = 10.0,
+    ["savegame.mod.pcomb.ground_detection.tolerance"] = 0.5,
+    ["savegame.mod.pcomb.ground_detection.radius"] = 5000.0,
+    ["savegame.mod.pcomb.last_ground_op"] = "",
+    ["savegame.mod.pcomb.last_ground_converted_count"] = 0,
 
     -- Profile UI helpers
     ["savegame.mod.pcomb.last_profile_op"] = "",
@@ -169,8 +185,7 @@ end
 -- Boolean option toggle button
 function PcombSettings.UiBoolOption(text, key)
     UiText(text)
-    UiTranslate(0, 35)
-
+    UiTranslate(0, 18)
     -- Read current state
     local currentValue = PcombSettings.get(key)
     local buttonClicked = false
@@ -207,7 +222,8 @@ function PcombSettings.UiBoolOption(text, key)
         end
     end
 
-    UiTranslate(0, 80)
+    -- provide modest spacing after a boolean option so items don't overlap
+    UiTranslate(0, 40)
     UiColor(1, 1, 1)
     return newValue
 end
@@ -562,6 +578,70 @@ function PcombSettings.drawIBSITAdvancedTab()
     local newComMargin = PcombSettings.UiSliderWithValue("ui/common/dot.png", 360, 20, comMargin * 100, 0, 30, "%.1f") / 100
     if newComMargin ~= comMargin then
         PcombSettings.set("savegame.mod.pcomb.ibsit.com_margin", newComMargin)
+    end
+    UiTranslate(0, 40)
+
+    -- Collision Damage Settings
+    UiFont("regular.ttf", 16)
+    UiColor(1, 0.8, 0.5)
+    UiText("Collision Damage System")
+    UiTranslate(0, 25)
+    UiFont("regular.ttf", 14)
+    UiColor(1, 1, 1)
+
+    PcombSettings.UiBoolOption("Enable Collision Damage", "savegame.mod.pcomb.ibsit.collision.enabled")
+
+    UiText("Acceleration Threshold")
+    UiTranslate(0, 25)
+    local accelThreshold = PcombSettings.get("savegame.mod.pcomb.ibsit.collision.acceleration_threshold")
+    local newAccelThreshold = PcombSettings.UiSliderWithValue("ui/common/dot.png", 360, 20, accelThreshold, 10, 200, "%.1f")
+    if newAccelThreshold ~= accelThreshold then
+        PcombSettings.set("savegame.mod.pcomb.ibsit.collision.acceleration_threshold", newAccelThreshold)
+    end
+    UiTranslate(0, 30)
+
+    UiText("Minimum Speed Threshold")
+    UiTranslate(0, 25)
+    local minSpeed = PcombSettings.get("savegame.mod.pcomb.ibsit.collision.min_speed")
+    local newMinSpeed = PcombSettings.UiSliderWithValue("ui/common/dot.png", 360, 20, minSpeed * 10, 5, 50, "%.1f") / 10
+    if newMinSpeed ~= minSpeed then
+        PcombSettings.set("savegame.mod.pcomb.ibsit.collision.min_speed", newMinSpeed)
+    end
+    UiTranslate(0, 30)
+
+    UiText("Damage Multiplier")
+    UiTranslate(0, 25)
+    local damageMultiplier = PcombSettings.get("savegame.mod.pcomb.ibsit.collision.damage_multiplier")
+    local newDamageMultiplier = PcombSettings.UiSliderWithValue("ui/common/dot.png", 360, 20, damageMultiplier * 100, 10, 500, "%.1f") / 100
+    if newDamageMultiplier ~= damageMultiplier then
+        PcombSettings.set("savegame.mod.pcomb.ibsit.collision.damage_multiplier", newDamageMultiplier)
+    end
+    UiTranslate(0, 30)
+
+    UiText("Collision Radius")
+    UiTranslate(0, 25)
+    local collisionRadius = PcombSettings.get("savegame.mod.pcomb.ibsit.collision.radius")
+    local newCollisionRadius = PcombSettings.UiSliderWithValue("ui/common/dot.png", 360, 20, collisionRadius * 10, 5, 50, "%.1f") / 10
+    if newCollisionRadius ~= collisionRadius then
+        PcombSettings.set("savegame.mod.pcomb.ibsit.collision.radius", newCollisionRadius)
+    end
+    UiTranslate(0, 30)
+
+    UiText("Secondary Damage Multiplier")
+    UiTranslate(0, 25)
+    local secondaryDamage = PcombSettings.get("savegame.mod.pcomb.ibsit.collision.secondary_damage")
+    local newSecondaryDamage = PcombSettings.UiSliderWithValue("ui/common/dot.png", 360, 20, secondaryDamage * 100, 0, 100, "%.1f") / 100
+    if newSecondaryDamage ~= secondaryDamage then
+        PcombSettings.set("savegame.mod.pcomb.ibsit.collision.secondary_damage", newSecondaryDamage)
+    end
+    UiTranslate(0, 30)
+
+    UiText("Secondary Distance Threshold")
+    UiTranslate(0, 25)
+    local secondaryDistance = PcombSettings.get("savegame.mod.pcomb.ibsit.collision.secondary_distance")
+    local newSecondaryDistance = PcombSettings.UiSliderWithValue("ui/common/dot.png", 360, 20, secondaryDistance * 100, 1, 50, "%.2f") / 100
+    if newSecondaryDistance ~= secondaryDistance then
+        PcombSettings.set("savegame.mod.pcomb.ibsit.collision.secondary_distance", newSecondaryDistance)
     end
     UiTranslate(0, 30)
 end
@@ -941,6 +1021,91 @@ function PcombSettings.drawMaterialsTab()
     UiColor(1, 1, 1)
 end
 
+function PcombSettings.drawGroundTab()
+    UiAlign("left top")
+    UiFont("regular.ttf", 18)
+
+    -- Debug banner: always visible when this tab is drawn
+    UiPush()
+    UiColor(0, 0, 0, 0.5)
+    UiRect(620, 36)
+    UiTranslate(6, 6)
+    UiFont("bold.ttf", 14)
+    UiColor(1, 0.8, 0.2)
+    UiText("GROUND UI ACTIVE")
+    UiPop()
+
+    UiText("Ground Detection & Scene Conversion")
+    UiTranslate(0, 30)
+
+    -- Enable toggle
+    PcombSettings.UiBoolOption("Enable Ground Detection (auto-convert non-ground to dynamic)", "savegame.mod.pcomb.ground_detection.enabled")
+
+    UiTranslate(0, 10)
+    UiText("Area threshold (min area to consider ground candidates)")
+    UiTranslate(0, 25)
+    local area = PcombSettings.get("savegame.mod.pcomb.ground_detection.area_threshold")
+    local newArea = PcombSettings.UiSliderWithValue("ui/common/dot.png", 360, 20, area, 1, 100, "%.1f")
+    if newArea ~= area then PcombSettings.set("savegame.mod.pcomb.ground_detection.area_threshold", newArea) end
+
+    UiTranslate(0, 30)
+    UiText("Height tolerance (meters) for plane grouping)")
+    UiTranslate(0, 25)
+    local tol = PcombSettings.get("savegame.mod.pcomb.ground_detection.tolerance")
+    local newTol = PcombSettings.UiSliderWithValue("ui/common/dot.png", 360, 20, tol * 100, 0, 200, "%.1f") / 100
+    if newTol ~= tol then PcombSettings.set("savegame.mod.pcomb.ground_detection.tolerance", newTol) end
+
+    UiTranslate(0, 30)
+    UiText("Detection Radius (search distance in meters)")
+    UiTranslate(0, 25)
+    local rad = PcombSettings.get("savegame.mod.pcomb.ground_detection.radius")
+    local newRad = PcombSettings.UiSliderWithValue("ui/common/dot.png", 360, 20, rad / 100, 1, 200, "%.0f") * 100
+    if newRad ~= rad then PcombSettings.set("savegame.mod.pcomb.ground_detection.radius", newRad) end
+
+    UiTranslate(0, 40)
+    UiPush()
+    if UiTextButton("Run Ground Detection & Convert Scene", 360, 36) then
+        -- Call into detection: this will be implemented in main.lua
+        if PcombDetection and type(PcombDetection.convertSceneExceptGround) == "function" then
+            local converted = PcombDetection.convertSceneExceptGround(
+                PcombSettings.get("savegame.mod.pcomb.ground_detection.area_threshold"),
+                PcombSettings.get("savegame.mod.pcomb.ground_detection.tolerance"),
+                PcombSettings.get("savegame.mod.pcomb.ground_detection.radius")
+            )
+            SetInt("savegame.mod.pcomb.last_ground_converted_count", converted or 0)
+            SetString("savegame.mod.pcomb.last_ground_op", "Converted " .. tostring(converted or 0) .. " bodies")
+        else
+            SetString("savegame.mod.pcomb.last_ground_op", "Conversion function not available")
+        end
+    end
+    UiPop()
+
+    UiTranslate(0, 34)
+    UiText("Last ground operation: " .. (GetString("savegame.mod.pcomb.last_ground_op") or "none"))
+    UiTranslate(0, 10)
+    UiText("Last converted count: " .. tostring(GetInt("savegame.mod.pcomb.last_ground_converted_count") or 0))
+
+    UiTranslate(0, 18)
+    UiText("Detected ground candidates (live):")
+    UiTranslate(0, 14)
+    if type(PcombDetection) == "table" and type(PcombDetection.findGroundCandidates) == "function" then
+        local group = PcombDetection.findGroundCandidates(
+            PcombSettings.get("savegame.mod.pcomb.ground_detection.area_threshold"),
+            PcombSettings.get("savegame.mod.pcomb.ground_detection.tolerance"),
+            PcombSettings.get("savegame.mod.pcomb.ground_detection.radius")
+        )
+        UiText("Count: " .. tostring(#group))
+        for i = 1, math.min(10, #group) do
+            local g = group[i]
+            if g and g.body then
+                UiText(string.format(" - body=%s area=%.1f bottomY=%.2f", tostring(g.body), tonumber(g.area) or 0, tonumber(g.bottomY) or 0))
+            end
+        end
+    else
+        UiText("(detection not available)")
+    end
+end
+
 -- Profiles management utilities
 -- Serialize a simple Lua table (numbers, booleans, strings, nested tables)
 function PcombSettings._serializeValue(v)
@@ -1230,6 +1395,15 @@ function PcombSettings.drawProfilesTab()
     UiFont("regular.ttf", 18)
 
     UiText("Profiles Manager")
+    -- Debug banner: always visible when this tab is drawn
+    UiPush()
+    UiColor(0, 0, 0, 0.5)
+    UiRect(620, 36)
+    UiTranslate(6, 6)
+    UiFont("bold.ttf", 14)
+    UiColor(0.4, 0.9, 1)
+    UiText("PROFILES UI ACTIVE")
+    UiPop()
     UiTranslate(0, 30)
 
     -- Create new profile (auto-generated name)
@@ -1245,6 +1419,17 @@ function PcombSettings.drawProfilesTab()
         end
     end
     UiTranslate(0, 40)
+
+    -- Quick test: create a sample profile with a few sentinel keys to make UI non-empty
+    if UiTextButton("Create Sample Profile (debug)", 320, 26) then
+        local t = PcombSettings._getTimestampString()
+        local name = "sample_" .. t
+        -- create a minimal profile table and save
+        local data = { ["test.sentinel"] = true, ["prgd.dust_amount"] = PcombSettings.get("savegame.mod.pcomb.prgd.dust_amount") }
+        SetString("savegame.mod.pcomb.profiles." .. name .. ".data", PcombSettings.serializeTable(data))
+        SetString("savegame.mod.pcomb.last_profile_op", "Created sample: " .. name)
+    end
+    UiTranslate(0, 18)
 
     UiText("Existing Profiles:")
     UiTranslate(0, 20)

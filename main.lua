@@ -235,6 +235,17 @@ PcombCore = {
         
         -- Initialize shared systems
         PcombPerformance.init()
+
+        -- Optionally run ground detection and convert scene bodies (non-ground) to dynamic to allow collapse
+        if GetBool("savegame.mod.pcomb.ground_detection.enabled") then
+            -- run conversion with configured params
+            local areaThresh = GetFloat("savegame.mod.pcomb.ground_detection.area_threshold") or 10.0
+            local tol = GetFloat("savegame.mod.pcomb.ground_detection.tolerance") or 0.5
+            local radius = GetFloat("savegame.mod.pcomb.ground_detection.radius") or 5000.0
+            local converted = PcombDetection.convertSceneExceptGround(areaThresh, tol, radius)
+            SetInt("savegame.mod.pcomb.last_ground_converted_count", converted or 0)
+            SetString("savegame.mod.pcomb.last_ground_op", "Auto-converted " .. tostring(converted or 0) .. " bodies on init")
+        end
         
         if GetBool("savegame.mod.pcomb.global.debug") then
             DebugPrint("Physics Combination Mod initialized")
@@ -599,11 +610,11 @@ PcombDetection = {
         local needsCollapse = false
         local collapseStrength = 0
         
-        -- Multiple collapse criteria with improved weight consideration
-          if (not comSupported) or stabilityRatio < materialAdjustedThreshold * 0.8 or 
+        -- Enhanced collapse criteria with more aggressive weak support detection
+          if (not comSupported) or stabilityRatio < materialAdjustedThreshold * 0.6 or 
               supportAreaRatio < minSupportAreaRatio or  -- Use minimum support area threshold
-           collapseProbability > 0.2 or
-           stressFactor > materialProps.strength * 0.6 or
+           collapseProbability > 0.1 or
+           stressFactor > materialProps.strength * 0.4 or
            hasMinimalSupport or  -- Check for minimal connections
            torqueBasedCollapse then  -- NEW: Include torque-based collapse
            
@@ -622,10 +633,10 @@ PcombDetection = {
         if GetBool("savegame.mod.pcomb.global.debug") then
             DebugPrint("Body collapse analysis for " .. tostring(body) .. ":")
             DebugPrint("  Material: " .. materialName .. " (resistance: " .. string.format("%.2f", materialProps.collapseResistance) .. ")")
-            DebugPrint("  Stability ratio: " .. string.format("%.3f", stabilityRatio) .. " (threshold: " .. string.format("%.3f", materialAdjustedThreshold * 0.8) .. ")")
+            DebugPrint("  Stability ratio: " .. string.format("%.3f", stabilityRatio) .. " (threshold: " .. string.format("%.3f", materialAdjustedThreshold * 0.6) .. ")")
             DebugPrint("  Support area ratio: " .. string.format("%.3f", supportAreaRatio) .. " (min required: " .. string.format("%.3f", minSupportAreaRatio) .. ")")
-            DebugPrint("  Collapse probability: " .. string.format("%.3f", collapseProbability) .. " (threshold: 0.2)")
-            DebugPrint("  Stress factor: " .. string.format("%.3f", stressFactor) .. " (threshold: " .. string.format("%.3f", materialProps.strength * 0.6) .. ")")
+            DebugPrint("  Collapse probability: " .. string.format("%.3f", collapseProbability) .. " (threshold: 0.1)")
+            DebugPrint("  Stress factor: " .. string.format("%.3f", stressFactor) .. " (threshold: " .. string.format("%.3f", materialProps.strength * 0.4) .. ")")
             DebugPrint("  Has minimal support: " .. tostring(hasMinimalSupport))
             DebugPrint("  Torque-based collapse: " .. tostring(torqueBasedCollapse) .. " (strength: " .. string.format("%.3f", torqueCollapseStrength) .. ")")
             DebugPrint("  NEEDS COLLAPSE: " .. tostring(needsCollapse) .. " (strength: " .. string.format("%.3f", collapseStrength) .. ")")
@@ -1200,6 +1211,89 @@ PcombDetection = {
         end
         
         return true
+    end,
+
+    -- NEW: Find candidate ground bodies by searching for large flat bodies near the lowest Y values
+    findGroundCandidates = function(areaThreshold, tolerance, radius)
+        areaThreshold = areaThreshold or 10.0
+        tolerance = tolerance or 0.5
+        radius = radius or 5000.0
+
+        QueryRequire("physical")
+        local allBodies = QueryAabbBodies(-10000, -10000, -10000, 10000, 10000, 10000)
+
+        -- Filter out obviously small bodies and vehicles; compute approximate top/bottom Y
+        local candidates = {}
+        for i = 1, #allBodies do
+            local b = allBodies[i]
+            if b and type(b) == "number" then
+                local bounds = GetBodyBounds(b)
+                if bounds and #bounds >= 6 then
+                    local width = math.max(0, bounds[4] - bounds[1])
+                    local depth = math.max(0, bounds[6] - bounds[3])
+                    local area = width * depth
+                    -- skip tiny bodies
+                    if area >= areaThreshold then
+                        local topY = bounds[5]
+                        local bottomY = bounds[2]
+                        table.insert(candidates, {body = b, area = area, topY = topY, bottomY = bottomY, bounds = bounds})
+                    end
+                end
+            end
+        end
+
+        if #candidates == 0 then return {} end
+
+        -- Find the lowest bottomY across candidates
+        local minBottom = math.huge
+        for _, c in ipairs(candidates) do if c.bottomY < minBottom then minBottom = c.bottomY end end
+
+        -- Group candidates whose bottomY are within tolerance of minBottom (ground plane cluster)
+        local groundGroup = {}
+        for _, c in ipairs(candidates) do
+            if math.abs(c.bottomY - minBottom) <= tolerance then
+                table.insert(groundGroup, c)
+            end
+        end
+
+        -- Optionally filter by proximity to origin/player: prefer large aggregated area
+        table.sort(groundGroup, function(a, b) return a.area > b.area end)
+        return groundGroup
+    end,
+
+    -- Convert all static bodies except those identified as groundGroup to dynamic. Returns number converted.
+    convertSceneExceptGround = function(areaThreshold, tolerance, radius)
+        areaThreshold = areaThreshold or 10.0
+        tolerance = tolerance or 0.5
+        radius = radius or 5000.0
+
+        local groundGroup = PcombDetection.findGroundCandidates(areaThreshold, tolerance, radius)
+        local groundMap = {}
+        for _, g in ipairs(groundGroup) do groundMap[g.body] = true end
+
+        -- Iterate all bodies and convert static ones excluding ground and excluding vehicles if disabled
+        QueryRequire("physical")
+        local allBodies = QueryAabbBodies(-10000, -10000, -10000, 10000, 10000, 10000)
+        local convertedCount = 0
+        for i = 1, #allBodies do
+            local b = allBodies[i]
+            if b and type(b) == "number" and not groundMap[b] then
+                local vehicleHandle = GetBodyVehicle(b)
+                if vehicleHandle and not GetBool("savegame.mod.pcomb.vehicles.enabled") then
+                    -- skip vehicles
+                else
+                    if PcombDetection.isBodyStatic(b) then
+                        local ok = PcombDetection.convertStaticToDynamic(b)
+                        if ok then convertedCount = convertedCount + 1 end
+                    end
+                end
+            end
+        end
+
+        if GetBool("savegame.mod.pcomb.global.debug") then
+            DebugPrint("Ground detection: found " .. tostring(#groundGroup) .. " ground bodies; converted " .. tostring(convertedCount) .. " bodies")
+        end
+        return convertedCount
     end,
     
     -- Enhanced multi-body structure analysis with spatial partitioning
@@ -2493,8 +2587,8 @@ PcombEffects = {
             safeApplyBodyImpulse(body, centerOfMass, {randomX, 0, randomZ})
         end
         
-        -- NEW: Track this body as falling for impact damage
-        PcombEffects.trackFallingBody(body, collapseData)
+        -- NEW: Break joints connected to this collapsing body and nearby bodies
+        PcombEffects.breakJointsForCollapsingBody(body, collapseStrength)
         
         -- Material-specific effects
         if materialProps.name == "Glass" or materialProps.name == "Window Glass" then
@@ -2929,6 +3023,395 @@ PcombEffects = {
                 PlaySound(LoadSound("sound/impact_light.ogg"), position, volume * 0.8)
             end
         end
+    end,
+
+    -- NEW: Break joints connected to collapsing body and nearby bodies
+    breakJointsForCollapsingBody = function(body, collapseStrength)
+        -- Respect centralized vehicle toggle: skip vehicle bodies when disabled
+        local vehicleHandle = GetBodyVehicle(body)
+        if vehicleHandle and not GetBool("savegame.mod.pcomb.vehicles.enabled") then
+            return
+        end
+
+        -- Get all shapes in the collapsing body
+        local shapes = GetBodyShapes(body)
+        if not shapes or #shapes == 0 then return end
+
+        local jointsBroken = 0
+        local maxJointsToBreak = math.floor(collapseStrength * 5) + 1  -- Scale with collapse strength
+
+        -- Break joints in the collapsing body itself
+        for _, shape in ipairs(shapes) do
+            if jointsBroken >= maxJointsToBreak then break end
+            
+            local shapeJoints = GetShapeJoints(shape)
+            if shapeJoints then
+                for _, joint in ipairs(shapeJoints) do
+                    if jointsBroken >= maxJointsToBreak then break end
+                    
+                    -- Check if joint should be broken based on collapse strength
+                    if math.random() < collapseStrength then
+                        Delete(joint)
+                        jointsBroken = jointsBroken + 1
+                        
+                        if GetBool("savegame.mod.pcomb.global.debug") then
+                            DebugPrint("Broke joint in collapsing body: " .. tostring(joint))
+                        end
+                    end
+                end
+            end
+        end
+
+        -- Find and break joints in nearby bodies (proximity-based joint breaking)
+        local bodyBounds = GetBodyBounds(body)
+        if bodyBounds and type(bodyBounds) == "table" and #bodyBounds >= 6 then
+            -- Validate bounds
+            local boundsValid = true
+            for i = 1, 6 do
+                if not bodyBounds[i] or type(bodyBounds[i]) ~= "number" then
+                    boundsValid = false
+                    break
+                end
+            end
+            
+            if boundsValid then
+                -- Query nearby bodies within joint-breaking radius
+                local jointBreakRadius = 3.0 * collapseStrength + 1.0  -- Scale radius with collapse strength
+                local queryMin = {
+                    bodyBounds[1] - jointBreakRadius,
+                    bodyBounds[2] - jointBreakRadius,
+                    bodyBounds[3] - jointBreakRadius
+                }
+                local queryMax = {
+                    bodyBounds[4] + jointBreakRadius,
+                    bodyBounds[5] + jointBreakRadius,
+                    bodyBounds[6] + jointBreakRadius
+                }
+                
+                QueryRequire("physical")
+                local nearbyBodies = QueryAabbBodies(queryMin, queryMax)
+                
+                for _, nearbyBody in ipairs(nearbyBodies) do
+                    if nearbyBody ~= body and IsBodyActive(nearbyBody) then
+                        -- Skip vehicle bodies when disabled
+                        local nearbyVehicle = GetBodyVehicle(nearbyBody)
+                        if nearbyVehicle and not GetBool("savegame.mod.pcomb.vehicles.enabled") then
+                            -- skip
+                        else
+                            -- Break joints in nearby body with reduced probability
+                            local nearbyShapes = GetBodyShapes(nearbyBody)
+                            if nearbyShapes then
+                                for _, shape in ipairs(nearbyShapes) do
+                                    if jointsBroken >= maxJointsToBreak then break end
+                                    
+                                    local shapeJoints = GetShapeJoints(shape)
+                                    if shapeJoints then
+                                        for _, joint in ipairs(shapeJoints) do
+                                            if jointsBroken >= maxJointsToBreak then break end
+                                            
+                                            -- Lower probability for nearby bodies
+                                            if math.random() < collapseStrength * 0.3 then
+                                                Delete(joint)
+                                                jointsBroken = jointsBroken + 1
+                                                
+                                                if GetBool("savegame.mod.pcomb.global.debug") then
+                                                    DebugPrint("Broke joint in nearby body: " .. tostring(joint))
+                                                end
+                                            end
+                                        end
+                                    end
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+        end
+
+        if GetBool("savegame.mod.pcomb.global.debug") and jointsBroken > 0 then
+            DebugPrint("Broke " .. jointsBroken .. " joints during collapse of body " .. tostring(body))
+        end
+    end,
+
+    -- NEW: Track body velocities for collision detection
+    collisionBodies = {}, -- Track bodies for collision detection
+
+    -- NEW: Process collision damage for bodies in motion
+    processCollisionDamage = function()
+        -- Check if collision damage is enabled
+        if not PcombSettings.get("savegame.mod.pcomb.ibsit.collision.enabled") then return end
+
+        local currentTime = GetTime()
+        
+        -- Query all physical bodies in the scene
+        QueryRequire("physical")
+        local allBodies = QueryAabbBodies(-1000, -1000, -1000, 1000, 1000, 1000)
+        
+        for _, body in ipairs(allBodies) do
+            if IsBodyActive(body) then
+                -- Skip vehicle bodies when vehicle processing is disabled
+                local vehicleHandle = GetBodyVehicle(body)
+                if vehicleHandle and not PcombSettings.get("savegame.mod.pcomb.vehicles.enabled") then
+                    -- skip
+                else
+                    local currentVelocity = GetBodyVelocity(body)
+                    local speed = VecLength(currentVelocity)
+                    
+                    -- Only track bodies moving at significant speeds
+                    if speed > PcombSettings.get("savegame.mod.pcomb.ibsit.collision.min_speed") then
+                        local bodyData = PcombEffects.collisionBodies[body]
+                        
+                        if not bodyData then
+                            -- Initialize tracking for this body
+                            PcombEffects.collisionBodies[body] = {
+                                lastVelocity = currentVelocity,
+                                lastSpeed = speed,
+                                lastTime = currentTime,
+                                materialProps = PcombDetection.getBodyMaterialProperties(body),
+                                bodyMass = GetBodyMass(body) or 1.0
+                            }
+                        else
+                            -- Check for collision (sudden velocity change)
+                            local velocityChange = VecLength(VecSub(currentVelocity, bodyData.lastVelocity))
+                            local timeDelta = currentTime - bodyData.lastTime
+                            
+                            if timeDelta > 0.01 then  -- Avoid division by very small numbers
+                                local acceleration = velocityChange / timeDelta
+                                
+                                -- Detect collision: high acceleration indicates impact
+                                if acceleration > PcombSettings.get("savegame.mod.pcomb.ibsit.collision.acceleration_threshold") and bodyData.lastSpeed > PcombSettings.get("savegame.mod.pcomb.ibsit.collision.min_speed") then
+                                    -- Calculate collision force
+                                    local collisionForce = bodyData.bodyMass * acceleration * 0.1 -- Scale down for balance
+                                    
+                                    if collisionForce > 10.0 then  -- Minimum threshold for damage
+                                        PcombEffects.applyCollisionDamage(body, collisionForce, currentVelocity, bodyData)
+                                        
+                                        if PcombSettings.get("savegame.mod.pcomb.global.debug") then
+                                            DebugPrint("Collision detected on body " .. tostring(body) .. " with force: " .. collisionForce)
+                                        end
+                                    end
+                                end
+                                
+                                -- Update tracking data
+                                bodyData.lastVelocity = currentVelocity
+                                bodyData.lastSpeed = speed
+                                bodyData.lastTime = currentTime
+                            end
+                        end
+                    else
+                        -- Remove slow bodies from tracking
+                        PcombEffects.collisionBodies[body] = nil
+                    end
+                end
+            else
+                -- Remove inactive bodies from tracking
+                PcombEffects.collisionBodies[body] = nil
+            end
+        end
+    end,
+
+    -- NEW: Apply damage from collisions
+    applyCollisionDamage = function(body, collisionForce, velocity, bodyData)
+        local bt = GetBodyTransform(body)
+        if not bt or not bt.pos then return end
+        local collisionPosition = bt.pos
+
+        -- Calculate damage based on collision force and material properties
+        local baseDamage = math.min(collisionForce / 500, 8) * PcombSettings.get("savegame.mod.pcomb.ibsit.collision.damage_multiplier") -- Cap at 8 for balance, less than impact damage
+        
+        -- Material-specific damage multipliers (slightly different from impact)
+        local materialMultiplier = 1.0
+        local matName = ""
+        if bodyData.materialProps and bodyData.materialProps.name then
+            matName = bodyData.materialProps.name
+        end
+
+        if matName == "Glass" then
+            materialMultiplier = 2.0 -- Glass shatters easily on collision
+        elseif matName == "Stone" or matName == "Concrete" then
+            materialMultiplier = 1.2 -- Stone resists but can crack
+        elseif matName == "Metal" or matName == "Steel" then
+            materialMultiplier = 0.8 -- Metal is more resilient
+        elseif matName == "Wood" then
+            materialMultiplier = 1.5 -- Wood splinters on impact
+        end
+        
+        local finalDamage = baseDamage * materialMultiplier
+        
+        -- Use configurable collision radius (smaller than impact radius)
+        local configRadius = PcombSettings.get("savegame.mod.pcomb.ibsit.collision.radius")
+        local collisionRadius = math.max(finalDamage * 0.3, configRadius)
+        if not collisionRadius or collisionRadius <= 0 then
+            collisionRadius = configRadius or 0.01
+        end
+        
+        -- Apply damage to the colliding body itself
+        local shapes = GetBodyShapes(body)
+        for _, shape in ipairs(shapes) do
+            local shapeBounds = GetShapeBounds(shape)
+            if shapeBounds and shapeBounds[1] and shapeBounds[2] and shapeBounds[3] and shapeBounds[4] and shapeBounds[5] and shapeBounds[6] then
+                -- Calculate damage position within shape bounds
+                local damagePos = {
+                    shapeBounds[1] + (shapeBounds[4] - shapeBounds[1]) * math.random(),
+                    shapeBounds[2] + (shapeBounds[5] - shapeBounds[2]) * math.random(),
+                    shapeBounds[3] + (shapeBounds[6] - shapeBounds[3]) * math.random()
+                }
+
+                                    -- Apply damage based on material
+                                    local woodDamage = finalDamage * PcombSettings.get("savegame.mod.pcomb.ibsit.wood_damage") / 100
+                                    local stoneDamage = finalDamage * PcombSettings.get("savegame.mod.pcomb.ibsit.stone_damage") / 100
+                                    local metalDamage = finalDamage * PcombSettings.get("savegame.mod.pcomb.ibsit.metal_damage") / 100                safeMakeHole(damagePos, woodDamage, stoneDamage, metalDamage)
+            end
+        end
+
+        -- Query nearby bodies for secondary damage
+        QueryRequire("physical")
+        local nearbyBodies = QueryAabbBodies(
+            collisionPosition[1] - collisionRadius, collisionPosition[2] - collisionRadius, collisionPosition[3] - collisionRadius,
+            collisionPosition[1] + collisionRadius, collisionPosition[2] + collisionRadius, collisionPosition[3] + collisionRadius
+        )
+        
+        for _, nearbyBody in ipairs(nearbyBodies) do
+            if nearbyBody ~= body and IsBodyActive(nearbyBody) then
+                -- Skip vehicle bodies when vehicle processing is disabled
+                local nearbyVeh = GetBodyVehicle(nearbyBody)
+                if nearbyVeh and not GetBool("savegame.mod.pcomb.vehicles.enabled") then
+                    -- skip
+                else
+                    -- Calculate damage based on distance from collision
+                    local bt = GetBodyTransform(nearbyBody)
+                    local bodyPos = bt and bt.pos
+                    if bodyPos and collisionPosition then
+                        local distance = VecLength(VecSub(bodyPos, collisionPosition))
+                        local distanceFactor = 0
+                        if collisionRadius and collisionRadius > 0 then
+                            distanceFactor = math.max(0, 1 - (distance / collisionRadius))
+                        end
+
+                        if distanceFactor > PcombSettings.get("savegame.mod.pcomb.ibsit.collision.secondary_distance") then  -- Higher threshold for nearby damage
+                            local damageToApply = finalDamage * distanceFactor * PcombSettings.get("savegame.mod.pcomb.ibsit.collision.secondary_damage")  -- Reduced damage for nearby bodies
+
+                            -- Apply damage to shapes in the nearby body
+                            local shapes = GetBodyShapes(nearbyBody)
+                            for _, shape in ipairs(shapes) do
+                                local shapeBounds = GetShapeBounds(shape)
+                                if shapeBounds and shapeBounds[1] and shapeBounds[2] and shapeBounds[3] and shapeBounds[4] and shapeBounds[5] and shapeBounds[6] then
+                                    -- Calculate damage position within shape bounds
+                                    local damagePos = {
+                                        shapeBounds[1] + (shapeBounds[4] - shapeBounds[1]) * math.random(),
+                                        shapeBounds[2] + (shapeBounds[5] - shapeBounds[2]) * math.random(),
+                                        shapeBounds[3] + (shapeBounds[6] - shapeBounds[3]) * math.random()
+                                    }
+
+                                    -- Apply damage based on material
+                                    local woodDamage = damageToApply * PcombSettings.get("savegame.mod.pcomb.ibsit.wood_damage") / 100
+                                    local stoneDamage = damageToApply * PcombSettings.get("savegame.mod.pcomb.ibsit.stone_damage") / 100
+                                    local metalDamage = damageToApply * PcombSettings.get("savegame.mod.pcomb.ibsit.metal_damage") / 100
+
+                                    safeMakeHole(damagePos, woodDamage, stoneDamage, metalDamage)
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+        end
+
+        -- Create collision effects
+        PcombEffects.createCollisionEffects(collisionPosition, finalDamage, matName)
+
+        -- Play collision sound
+        PcombEffects.playCollisionSound(collisionPosition, finalDamage, matName)
+    end,
+
+    -- NEW: Create visual effects for collisions
+    createCollisionEffects = function(position, intensity, materialName)
+        local effectCount = math.floor(intensity * 3) + 2  -- Fewer effects than impact
+        
+        for i = 1, effectCount do
+            local offset = {
+                (math.random() - 0.5) * 1.5,
+                math.random() * 0.3,
+                (math.random() - 0.5) * 1.5
+            }
+            local effectPos = VecAdd(position, offset)
+            
+            -- Material-specific collision particles (different from impact)
+            if materialName == "Glass" then
+                -- Glass creates sharp shards
+                SpawnParticle(effectPos, {
+                    (math.random() - 0.5) * 1.5,
+                    math.random() * 1.0,
+                    (math.random() - 0.5) * 1.5
+                }, math.random() * 1.5)
+            elseif materialName == "Stone" or materialName == "Concrete" then
+                -- Stone/concrete creates chips and dust
+                SpawnParticle(effectPos, {
+                    (math.random() - 0.5) * 2,
+                    math.random() * 1.5,
+                    (math.random() - 0.5) * 2
+                }, math.random() * 2.5)
+            elseif materialName == "Metal" or materialName == "Steel" then
+                -- Metal creates small sparks and shavings
+                SpawnParticle(effectPos, {
+                    (math.random() - 0.5) * 1.2,
+                    math.random() * 0.8,
+                    (math.random() - 0.5) * 1.2
+                }, math.random() * 1.2)
+            elseif materialName == "Wood" then
+                -- Wood creates splinters
+                SpawnParticle(effectPos, {
+                    (math.random() - 0.5) * 2,
+                    math.random() * 1.2,
+                    (math.random() - 0.5) * 2
+                }, math.random() * 2)
+            else
+                -- Default collision dust
+                SpawnParticle(effectPos, {
+                    (math.random() - 0.5) * 1.5,
+                    math.random() * 0.8,
+                    (math.random() - 0.5) * 1.5
+                }, math.random() * 1.5)
+            end
+        end
+    end,
+
+    -- NEW: Play collision sound based on material and intensity
+    playCollisionSound = function(position, intensity, materialName)
+        local volume = PcombSettings.get("savegame.mod.pcomb.ibsit.volume") * 0.8  -- Slightly quieter than impact
+        
+        if materialName == "Glass" then
+            if intensity > 2 then
+                PlaySound(LoadSound("sound/glass_shatter_heavy.ogg"), position, volume * 1.1)
+            else
+                PlaySound(LoadSound("sound/glass_shatter_light.ogg"), position, volume)
+            end
+        elseif materialName == "Stone" or materialName == "Concrete" then
+            if intensity > 2 then
+                PlaySound(LoadSound("sound/stone_collision_heavy.ogg"), position, volume)
+            else
+                PlaySound(LoadSound("sound/stone_collision_light.ogg"), position, volume * 0.9)
+            end
+        elseif materialName == "Metal" or materialName == "Steel" then
+            if intensity > 2 then
+                PlaySound(LoadSound("sound/metal_collision_heavy.ogg"), position, volume * 1.1)
+            else
+                PlaySound(LoadSound("sound/metal_collision_light.ogg"), position, volume)
+            end
+        elseif materialName == "Wood" then
+            if intensity > 2 then
+                PlaySound(LoadSound("sound/wood_collision_heavy.ogg"), position, volume)
+            else
+                PlaySound(LoadSound("sound/wood_collision_light.ogg"), position, volume * 0.9)
+            end
+        else
+            -- Default collision sound
+            if intensity > 2 then
+                PlaySound(LoadSound("sound/collision_heavy.ogg"), position, volume)
+            else
+                PlaySound(LoadSound("sound/collision_light.ogg"), position, volume * 0.8)
+            end
+        end
     end
 }
 
@@ -3004,7 +3487,7 @@ function tick(dt)
     PcombPerformance.update(dt)
     
     -- Handle pause menu activation (use a key combination or specific key)
-    if InputPressed("p") and InputDown("ctrl") then  -- Ctrl+P to open/close menu
+    if InputPressed("i") and InputDown("ctrl") then  -- Ctrl+P to open/close menu
         pauseMenuEnabled = not pauseMenuEnabled
     end
     
@@ -3064,6 +3547,11 @@ function tick(dt)
                 local analysisData = PcombDetection.analyzeBreakEvent(explosionPoint, explosionSize)
                 PcombEffects.processEffects(analysisData)
             end
+        end
+
+        -- Process collision damage for bodies in motion
+        if PcombPerformance.shouldProcessEffect() then
+            PcombEffects.processCollisionDamage()
         end
     end
 end

@@ -2913,7 +2913,7 @@ function tick(dt)
     PcombPerformance.update(dt)
     
     -- Handle pause menu activation (use a key combination or specific key)
-    if InputPressed("p") and InputDown("ctrl") then  -- Ctrl+P to open/close menu
+    if InputPressed("i") and InputDown("ctrl") then  -- Ctrl+P to open/close menu
         pauseMenuEnabled = not pauseMenuEnabled
     end
     

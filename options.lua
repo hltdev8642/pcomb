@@ -99,6 +99,8 @@ function draw()
     elseif currentTab == 8 then
         PcombSettings.drawMaterialsTab()
     elseif currentTab == 9 then
+        PcombSettings.drawGroundTab()
+    elseif currentTab == 10 then
         PcombSettings.drawProfilesTab() -- Profiles UI
     end
 end
