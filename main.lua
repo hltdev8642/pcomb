@@ -880,6 +880,28 @@ PcombDetection = {
         
         return "default"
     end,
+
+    -- NEW: Get consolidated material properties for a body
+    getBodyMaterialProperties = function(body)
+        local materialName = PcombDetection.getBodyMaterial(body) or "default"
+        local baseProps = PcombMaterials.getProperties(materialName) or PcombMaterials.properties["default"]
+
+        -- Clone properties to avoid mutating global property table
+        local props = {}
+        for k, v in pairs(baseProps) do props[k] = v end
+
+        -- Attach effective mass for this body (if available)
+        local effMass = nil
+        local ok, em = pcall(function() return PcombMaterials.calculateEffectiveMass(body, materialName) end)
+        if ok and em then effMass = em end
+        if type(effMass) == "number" then
+            props.effectiveMass = effMass
+        else
+            props.effectiveMass = GetBodyMass(body) or 0
+        end
+
+        return props
+    end,
     
     analyzeMultiDirectionalSupport = function(body, bounds, materialName)
         local analysis = {
